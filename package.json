@@ -1,0 +1,31 @@
+{
+  "name": "support-agent-backend-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for ExtraHand Support Agent live chat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "websocket",
+    "chat",
+    "support",
+    "agent"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "ioredis": "^5.8.2",
+    "mongoose": "^9.1.1",
+    "pg": "^8.16.3",
+    "redis": "^5.10.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}

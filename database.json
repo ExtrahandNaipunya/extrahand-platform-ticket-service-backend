@@ -1,0 +1,284 @@
+{
+  "sessions": [
+    {
+      "id": 1,
+      "customer_name": "Ajay",
+      "customer_email": "admin@gmail.com",
+      "agent_email": null,
+      "status": "closed",
+      "created_at": "2025-12-31T11:00:18.737Z",
+      "closed_at": "2025-12-31T12:41:29.020Z"
+    },
+    {
+      "id": 2,
+      "customer_name": "Ajay",
+      "customer_email": "admin@gmail.com",
+      "agent_email": null,
+      "status": "closed",
+      "created_at": "2025-12-31T11:03:02.248Z",
+      "closed_at": "2026-01-02T10:55:42.282Z"
+    },
+    {
+      "id": 3,
+      "customer_name": "Guest User",
+      "customer_email": "guest@example.com",
+      "agent_email": "admin",
+      "status": "active",
+      "created_at": "2025-12-31T12:42:29.647Z",
+      "closed_at": null,
+      "joined_at": "2026-01-02T11:36:57.816Z"
+    },
+    {
+      "id": 4,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "admin",
+      "status": "closed",
+      "created_at": "2026-01-02T11:02:53.736Z",
+      "closed_at": "2026-01-02T11:39:23.896Z",
+      "joined_at": "2026-01-02T11:36:59.254Z"
+    },
+    {
+      "id": 5,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "admin",
+      "status": "closed",
+      "created_at": "2026-01-02T12:23:50.097Z",
+      "closed_at": "2026-01-05T05:57:52.067Z",
+      "joined_at": "2026-01-02T12:24:03.510Z"
+    },
+    {
+      "id": 6,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "admin",
+      "status": "closed",
+      "created_at": "2026-01-02T12:36:44.847Z",
+      "closed_at": "2026-01-02T12:38:13.156Z",
+      "joined_at": "2026-01-02T12:36:47.619Z"
+    },
+    {
+      "id": 7,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "admin",
+      "status": "closed",
+      "created_at": "2026-01-02T12:57:51.176Z",
+      "closed_at": "2026-01-02T12:58:02.576Z",
+      "joined_at": "2026-01-02T12:57:53.870Z"
+    },
+    {
+      "id": 8,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "agent@gmail.com",
+      "status": "closed",
+      "created_at": "2026-01-02T13:00:10.041Z",
+      "closed_at": "2026-01-05T06:42:17.005Z",
+      "joined_at": "2026-01-05T06:00:00.000Z",
+      "resolution_note": "Thank you for reaching us\n"
+    },
+    {
+      "id": 9,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "agent@gmail.com",
+      "status": "closed",
+      "issue_category": "payment_billing",
+      "issue_type": "wrong_restaurant",
+      "issue_category_label": "Payment and Billing",
+      "issue_type_label": "I paid the bill to the wrong restaurant",
+      "created_at": "2026-01-05T06:44:13.222Z",
+      "closed_at": "2026-01-05T06:49:29.015Z",
+      "joined_at": "2026-01-05T06:44:34.115Z",
+      "resolution_note": ""
+    },
+    {
+      "id": 10,
+      "customer_name": "Admin User",
+      "customer_email": "admin@gmail.com",
+      "agent_email": "agent@gmail.com",
+      "status": "closed",
+      "issue_category": "general",
+      "issue_type": "pricing_info",
+      "issue_category_label": "General Inquiry",
+      "issue_type_label": "Pricing and packages",
+      "created_at": "2026-01-05T06:53:40.592Z",
+      "closed_at": "2026-01-05T06:54:20.249Z",
+      "joined_at": "2026-01-05T06:53:50.408Z",
+      "resolution_note": ""
+    }
+  ],
+  "messages": [
+    {
+      "id": 1,
+      "session_id": 2,
+      "content": "Session closed. Resolution: hello Thanks for reaching out.",
+      "sender": "system",
+      "timestamp": "2026-01-02T10:55:42.283Z"
+    },
+    {
+      "id": 2,
+      "session_id": 4,
+      "content": "hi",
+      "sender": "agent",
+      "timestamp": "2026-01-02T11:37:01.798Z"
+    },
+    {
+      "id": 3,
+      "session_id": 4,
+      "content": "hi hello i have a problem with payment refund",
+      "sender": "customer",
+      "timestamp": "2026-01-02T11:38:13.454Z"
+    },
+    {
+      "id": 4,
+      "session_id": 4,
+      "content": "okay i will check your current status",
+      "sender": "agent",
+      "timestamp": "2026-01-02T11:38:25.754Z"
+    },
+    {
+      "id": 5,
+      "session_id": 4,
+      "content": "Let me escalate this to our senior team.",
+      "sender": "agent",
+      "timestamp": "2026-01-02T11:38:50.979Z"
+    },
+    {
+      "id": 6,
+      "session_id": 4,
+      "content": "okay thankyou",
+      "sender": "customer",
+      "timestamp": "2026-01-02T11:39:09.753Z"
+    },
+    {
+      "id": 7,
+      "session_id": 4,
+      "content": "Session closed. Resolution: your issue has been resolved",
+      "sender": "system",
+      "timestamp": "2026-01-02T11:39:23.896Z"
+    },
+    {
+      "id": 8,
+      "session_id": 5,
+      "content": "Hello! How can I help you today?",
+      "sender": "agent",
+      "timestamp": "2026-01-02T12:24:16.825Z"
+    },
+    {
+      "id": 9,
+      "session_id": 5,
+      "content": "i have issue with the refund",
+      "sender": "customer",
+      "timestamp": "2026-01-02T12:24:31.023Z"
+    },
+    {
+      "id": 10,
+      "session_id": 5,
+      "content": "Session closed. Resolution: your problem has been resolved",
+      "sender": "system",
+      "timestamp": "2026-01-02T12:31:13.525Z"
+    },
+    {
+      "id": 11,
+      "session_id": 6,
+      "content": "Thank you for contacting ExtraHand support!",
+      "sender": "agent",
+      "timestamp": "2026-01-02T12:36:58.707Z"
+    },
+    {
+      "id": 12,
+      "session_id": 7,
+      "content": "ghidkjhfghsj",
+      "sender": "agent",
+      "timestamp": "2026-01-02T12:57:56.169Z"
+    },
+    {
+      "id": 13,
+      "session_id": 8,
+      "content": "hi",
+      "sender": "customer",
+      "timestamp": "2026-01-05T05:57:31.899Z"
+    },
+    {
+      "id": 14,
+      "session_id": 8,
+      "content": "hi",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:41:43.458Z"
+    },
+    {
+      "id": 15,
+      "session_id": 8,
+      "content": "Thank you for contacting ExtraHand support!",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:42:05.861Z"
+    },
+    {
+      "id": 16,
+      "session_id": 8,
+      "content": "Session closed. Resolution: Thank you for reaching us\n",
+      "sender": "system",
+      "timestamp": "2026-01-05T06:42:17.005Z"
+    },
+    {
+      "id": 17,
+      "session_id": 9,
+      "content": "Hello! How can I help you today?",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:48:06.580Z"
+    },
+    {
+      "id": 18,
+      "session_id": 9,
+      "content": "im facing an issue with the refund problem and i hope you solve it at ease",
+      "sender": "customer",
+      "timestamp": "2026-01-05T06:48:36.410Z"
+    },
+    {
+      "id": 19,
+      "session_id": 9,
+      "content": "okay i will check with your recent history ",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:48:57.856Z"
+    },
+    {
+      "id": 20,
+      "session_id": 9,
+      "content": "okay do it fast and letme know the response",
+      "sender": "customer",
+      "timestamp": "2026-01-05T06:49:16.626Z"
+    },
+    {
+      "id": 21,
+      "session_id": 9,
+      "content": "okay ",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:49:22.594Z"
+    },
+    {
+      "id": 22,
+      "session_id": 9,
+      "content": "thankyou ",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:49:25.491Z"
+    },
+    {
+      "id": 23,
+      "session_id": 10,
+      "content": "Thank you for contacting ExtraHand support!",
+      "sender": "agent",
+      "timestamp": "2026-01-05T06:54:08.198Z"
+    },
+    {
+      "id": 24,
+      "session_id": 10,
+      "content": "oky",
+      "sender": "customer",
+      "timestamp": "2026-01-05T06:54:14.746Z"
+    }
+  ],
+  "agents": []
+}
