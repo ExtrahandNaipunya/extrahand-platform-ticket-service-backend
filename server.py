@@ -53,6 +53,10 @@ class CloseSessionRequest(BaseModel):
 class CreateSessionRequest(BaseModel):
     customer_name: str
     customer_email: str
+    issue_category: Optional[str] = None
+    issue_type: Optional[str] = None
+    issue_category_label: Optional[str] = None
+    issue_type_label: Optional[str] = None
 
 # WebSocket Connection Manager
 class ConnectionManager:
@@ -243,8 +247,15 @@ async def create_session(request: CreateSessionRequest):
     if existing_session:
         return {"session_id": existing_session['id'], "status": "existing"}
     
-    # Create new session
-    session = db.create_session_with_email(request.customer_name, request.customer_email)
+    # Create new session with issue information
+    session = db.create_session_with_email(
+        request.customer_name, 
+        request.customer_email,
+        request.issue_category,
+        request.issue_type,
+        request.issue_category_label,
+        request.issue_type_label
+    )
     
     # Notify all agents about new pending chat
     await manager.broadcast_pending_chats()
@@ -634,13 +645,15 @@ async def agent_websocket(websocket: WebSocket, username: str):
     try:
         while True:
             data = await websocket.receive_json()
-            if data.get('type') == 'join_chat':
+            action = data.get('action', data.get('type'))
+            
+            if action == 'join_chat':
                 await manager.join_chat(agent_id, data['session_id'])
                 if data['session_id'] not in manager.active_sessions:
                     manager.active_sessions[data['session_id']] = {}
                 manager.active_sessions[data['session_id']]['agent'] = websocket
                 
-            elif data.get('action') == 'open_chat' or data.get('type') == 'open_chat':
+            elif action == 'open_chat':
                 # Send chat history when agent opens an active chat
                 session_id = data['session_id']
                 history = db.get_session_history(session_id)
@@ -651,8 +664,11 @@ async def agent_websocket(websocket: WebSocket, username: str):
                 })
                 print(f"[INFO] Sent history for session {session_id} to agent {agent_id}")
                 
-            elif data.get('type') == 'message':
-                await manager.handle_message(data['session_id'], 'agent', agent_id, data['content'])
+            elif action == 'send_message':
+                session_id = data.get('session_id')
+                content = data.get('content', '')
+                if session_id and content:
+                    await manager.handle_message(session_id, 'agent', agent_id, content)
                 
     except WebSocketDisconnect:
         if agent_id in manager.agent_dashboards:

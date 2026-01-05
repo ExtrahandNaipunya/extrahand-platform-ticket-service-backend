@@ -209,9 +209,10 @@ def create_agent(username, password, name):
         conn.close()
 
 def get_agent_by_username(username):
+    """Get agent by username or email"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM agents WHERE username = ?", (username,))
+    cursor.execute("SELECT * FROM agents WHERE username = ? OR email = ?", (username, username))
     agent = cursor.fetchone()
     conn.close()
     return agent
@@ -270,7 +271,9 @@ def get_or_create_customer_by_email(email, name):
     return None
 
 # --- Chat Operations ---
-def create_session_with_email(customer_name: str, customer_email: str):
+def create_session_with_email(customer_name: str, customer_email: str, 
+                             issue_category: str = None, issue_type: str = None,
+                             issue_category_label: str = None, issue_type_label: str = None):
     """Create a new chat session for a customer (create customer if needed)"""
     # Get or create customer
     customer = get_or_create_customer_by_email(customer_email, customer_name)
@@ -283,8 +286,11 @@ def create_session_with_email(customer_name: str, customer_email: str):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO chat_sessions (customer_id, status) VALUES (?, 'pending')",
-        (customer_id,)
+        """INSERT INTO chat_sessions (customer_id, customer_name, customer_email, status, 
+           issue_category, issue_type, issue_category_label, issue_type_label) 
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (customer_id, customer_name, customer_email, issue_category, issue_type, 
+         issue_category_label, issue_type_label)
     )
     session_id = cursor.lastrowid
     
@@ -292,10 +298,10 @@ def create_session_with_email(customer_name: str, customer_email: str):
     from datetime import datetime
     ticket_id = f"TICKET-{datetime.now().strftime('%Y%m%d')}-{session_id:04d}"
     
-    # Update session with ticket_id
+    # Update session with ticket_id and started_at
     cursor.execute(
-        "UPDATE chat_sessions SET ticket_id = ? WHERE id = ?",
-        (ticket_id, session_id)
+        "UPDATE chat_sessions SET ticket_id = ?, started_at = ? WHERE id = ?",
+        (ticket_id, datetime.now(), session_id)
     )
     conn.commit()
     
