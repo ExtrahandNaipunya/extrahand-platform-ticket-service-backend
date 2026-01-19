@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import os
 import json
+import psycopg2.extras
 from datetime import datetime
 from contextlib import asynccontextmanager
 import database as db
@@ -50,6 +51,10 @@ class Token(BaseModel):
 class CloseSessionRequest(BaseModel):
     resolution_note: Optional[str] = None
 
+class FeedbackRequest(BaseModel):
+    rating: int
+    feedback: Optional[str] = None
+
 class CreateSessionRequest(BaseModel):
     customer_name: str
     customer_email: str
@@ -78,6 +83,7 @@ class ConnectionManager:
         return session_id
 
     async def connect_agent_dashboard(self, websocket: WebSocket, identifier: str):
+        print(f"[INFO] 🔌 Agent dashboard connection attempt with identifier: '{identifier}'")
         await websocket.accept()
         
         # Try to find agent by username first, then by email (for compatibility)
@@ -85,7 +91,8 @@ class ConnectionManager:
         if not agent:
             # Try finding by checking all agents (in case identifier is email-like)
             # For now, just return error
-            print(f"[ERROR] Agent not found with identifier: {identifier}")
+            print(f"[ERROR] ❌ Agent not found with identifier: '{identifier}'")
+            print(f"[DEBUG] Available agents query result: {agent}")
             await websocket.send_json({"type": "error", "message": f"Agent not found: {identifier}"})
             await websocket.close()
             return None
@@ -138,35 +145,45 @@ class ConnectionManager:
         print(f"[INFO] Agent {agent_id} joined session {session_id}")
 
     async def handle_message(self, session_id: int, sender_type: str, sender_id: int, content: str):
-        # Save message to database (database automatically adds UTC timestamp)
-        msg = db.add_message(session_id, sender_type, sender_id, content)
+        """Handle and broadcast messages, storing them in the database"""
+        print(f"[INFO] 💬 Handling message: session={session_id}, sender={sender_type}, content_preview={content[:50]}...")
         
-        # Ensure timestamp is in ISO format with Z suffix for UTC
+        # Save message to database
+        try:
+            msg = db.add_message(session_id, sender_type, sender_id, content)
+            print(f"[INFO] ✅ Message saved to database with ID: {msg['id']}")
+        except Exception as e:
+            print(f"[ERROR] ❌ Failed to save message to database: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # Format timestamp for transmission
         timestamp = msg['timestamp']
-        if not timestamp.endswith('Z'):
-            timestamp = timestamp.replace(' ', 'T') + 'Z'
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.isoformat()
+        
+        message_data = {
+            "type": "message",
+            "sender": sender_type,
+            "content": content,
+            "timestamp": timestamp,
+            "message_id": msg['id']
+        }
         
         # Broadcast to customer
         if session_id in self.active_sessions and 'customer' in self.active_sessions[session_id]:
             try:
-                await self.active_sessions[session_id]['customer'].send_json({
-                    "type": "message",
-                    "sender": sender_type,
-                    "content": content,
-                    "timestamp": timestamp
-                })
+                await self.active_sessions[session_id]['customer'].send_json(message_data)
+                print(f"[INFO] 📤 Message sent to customer")
             except Exception as e:
                 print(f"[ERROR] Failed to send to customer: {e}")
         
         # Broadcast to agent
         if session_id in self.active_sessions and 'agent' in self.active_sessions[session_id]:
             try:
-                await self.active_sessions[session_id]['agent'].send_json({
-                    "type": "message",
-                    "sender": sender_type,
-                    "content": content,
-                    "timestamp": timestamp
-                })
+                await self.active_sessions[session_id]['agent'].send_json(message_data)
+                print(f"[INFO] 📤 Message sent to agent")
             except Exception as e:
                 print(f"[ERROR] Failed to send to agent: {e}")
         
@@ -188,12 +205,20 @@ class ConnectionManager:
                     print(f"[ERROR] Failed to broadcast to agent {agent_id}: {e}")
 
     async def broadcast_pending_chats(self):
+        """Broadcast pending chats to all connected agents"""
         pending = db.get_pending_sessions()
-        for ws in self.agent_dashboards.values():
+        print(f"[INFO] Broadcasting {len(pending)} pending chats to {len(self.agent_dashboards)} agents")
+        for agent_id, ws in self.agent_dashboards.items():
             try:
-                await ws.send_json({"type": "pending_chats", "data": pending})
-            except:
-                pass
+                active = db.get_agent_active_sessions(agent_id)
+                await ws.send_json({
+                    "type": "dashboard_update",
+                    "pending": pending,
+                    "active": active
+                })
+                print(f"[INFO] Sent dashboard update to agent {agent_id}")
+            except Exception as e:
+                print(f"[ERROR] Failed to broadcast to agent {agent_id}: {e}")
 
     async def broadcast_dashboard_updates(self, agent_id: int):
         if agent_id in self.agent_dashboards:
@@ -256,6 +281,10 @@ async def create_session(request: CreateSessionRequest):
         request.issue_category_label,
         request.issue_type_label
     )
+    
+    print(f"[INFO] Created new session {session['id']} for customer {request.customer_email}")
+    print(f"[INFO] Issue: {request.issue_category_label} - {request.issue_type_label}")
+    print(f"[INFO] Currently {len(manager.agent_dashboards)} agents connected")
     
     # Notify all agents about new pending chat
     await manager.broadcast_pending_chats()
@@ -373,73 +402,91 @@ async def get_agent_stats_by_username(agent_username: str):
             raise HTTPException(status_code=404, detail="Agent not found")
         
         agent_id = agent['id']
-        conn = db.get_db_connection()
-        cursor = conn.cursor()
         
-        # Count closed sessions
-        cursor.execute('SELECT COUNT(*) as count FROM chat_sessions WHERE agent_id = ? AND status = "closed"', (agent_id,))
-        closed_count = cursor.fetchone()['count']
+        # Get comprehensive analytics from database
+        analytics = db.get_agent_analytics(agent_id)
         
-        # Count active sessions
-        cursor.execute('SELECT COUNT(*) as count FROM chat_sessions WHERE agent_id = ? AND status = "active"', (agent_id,))
-        active_count = cursor.fetchone()['count']
-        
-        # Count pending sessions assigned to agent
-        cursor.execute('SELECT COUNT(*) as count FROM chat_sessions WHERE agent_id = ? AND status = "pending"', (agent_id,))
-        pending_count = cursor.fetchone()['count']
-        
-        # Calculate average rating (from closed sessions)
-        cursor.execute('SELECT AVG(rating) as avg_rating FROM chat_sessions WHERE agent_id = ? AND rating IS NOT NULL', (agent_id,))
-        result = cursor.fetchone()
-        avg_rating = round(result['avg_rating'], 1) if result['avg_rating'] else 0
-        
-        # Calculate average response time
-        cursor.execute('''
-            SELECT AVG(
-                (julianday(closed_at) - julianday(started_at)) * 24 * 60
-            ) as avg_time
-            FROM chat_sessions 
-            WHERE agent_id = ? AND status = "closed" AND started_at IS NOT NULL AND closed_at IS NOT NULL
-        ''', (agent_id,))
-        result = cursor.fetchone()
-        avg_time = result['avg_time'] if result['avg_time'] else 0
-        
-        # Format response time
-        if avg_time < 1:
-            response_time = f"{int(avg_time * 60)}s"
-        elif avg_time < 60:
-            response_time = f"{int(avg_time)}m {int((avg_time % 1) * 60)}s"
+        # Format response time (seconds to readable format)
+        avg_response_seconds = analytics['avg_response_seconds']
+        if avg_response_seconds < 60:
+            response_time = f"{int(avg_response_seconds)}s"
         else:
-            hours = int(avg_time / 60)
-            minutes = int(avg_time % 60)
-            response_time = f"{hours}h {minutes}m"
+            minutes = int(avg_response_seconds / 60)
+            seconds = int(avg_response_seconds % 60)
+            response_time = f"{minutes}m {seconds}s"
         
-        # Calculate total online hours (sum of session durations)
-        cursor.execute('''
-            SELECT SUM(
-                (julianday(COALESCE(closed_at, CURRENT_TIMESTAMP)) - julianday(created_at)) * 24
-            ) as total_hours
-            FROM chat_sessions 
-            WHERE agent_id = ?
-        ''', (agent_id,))
-        result = cursor.fetchone()
-        total_hours = result['total_hours'] if result['total_hours'] else 0
-        online_hours = f"{int(total_hours)}h"
-        
-        conn.close()
+        # Format resolution time
+        avg_resolution_seconds = analytics['avg_resolution_seconds']
+        if avg_resolution_seconds < 60:
+            resolution_time = f"{int(avg_resolution_seconds)}s"
+        else:
+            minutes = int(avg_resolution_seconds / 60)
+            seconds = int(avg_resolution_seconds % 60)
+            resolution_time = f"{minutes}m {seconds}s"
         
         return {
-            "closed_count": closed_count,
-            "active_count": active_count,
-            "pending_count": pending_count,
-            "average_rating": avg_rating,
+            "total_conversations": analytics['total_conversations'],
+            "resolved_count": analytics['resolved_count'],
+            "resolution_rate": round((analytics['resolved_count'] / analytics['total_conversations'] * 100) if analytics['total_conversations'] > 0 else 0, 1),
+            "active_count": analytics['active_count'],
+            "handled_today": analytics['handled_today'],
             "avg_response_time": response_time,
-            "online_hours": online_hours
+            "avg_response_seconds": avg_response_seconds,
+            "avg_resolution_time": resolution_time,
+            "avg_resolution_seconds": avg_resolution_seconds,
+            "avg_rating": analytics['avg_rating'],
+            "rating_count": analytics['rating_count'],
+            "total_hours_month": analytics['total_hours_month']
         }
     except HTTPException:
         raise
     except Exception as e:
         print(f"[ERROR] Failed to get agent statistics: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/agent/weekly-stats/{agent_username}")
+async def get_agent_weekly_stats(agent_username: str):
+    """Get agent's weekly performance statistics"""
+    try:
+        agent = db.get_agent_by_username(agent_username)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        agent_id = agent['id']
+        weekly_stats = db.get_agent_weekly_stats(agent_id)
+        
+        # Convert date objects to strings for JSON serialization
+        for stat in weekly_stats:
+            if stat.get('date'):
+                stat['date'] = stat['date'].isoformat()
+        
+        return {"weekly_stats": weekly_stats}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Failed to get weekly stats: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/agent/daily-activity/{agent_username}")
+async def get_agent_daily_activity(agent_username: str):
+    """Get agent's today activity"""
+    try:
+        agent = db.get_agent_by_username(agent_username)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        agent_id = agent['id']
+        daily_activity = db.get_agent_daily_activity(agent_id)
+        
+        return daily_activity
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Failed to get daily activity: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -463,7 +510,7 @@ async def get_ticket_by_id(ticket_id: str):
     try:
         # Get ticket from chat_sessions table
         conn = db.get_db_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         cursor.execute('''
             SELECT cs.*, c.name as customer_name, c.email as customer_email, 
@@ -471,36 +518,27 @@ async def get_ticket_by_id(ticket_id: str):
             FROM chat_sessions cs
             LEFT JOIN customers c ON cs.customer_id = c.id
             LEFT JOIN agents a ON cs.agent_id = a.id
-            WHERE cs.ticket_id = ? AND cs.status = 'closed'
+            WHERE cs.ticket_id = %s AND cs.status = 'closed'
         ''', (ticket_id,))
         
         ticket = cursor.fetchone()
         if not ticket:
-            conn.close()
+            db.release_db_connection(conn)
             raise HTTPException(status_code=404, detail="Ticket not found")
         
         ticket_dict = dict(ticket)
         session_id = ticket_dict['id']
         
-        # Get messages for this session
-        cursor.execute('''
-            SELECT m.*, 
-                   CASE 
-                       WHEN m.sender_type = 'agent' THEN a.name
-                       WHEN m.sender_type = 'customer' THEN c.name
-                       ELSE 'System'
-                   END as sender_name
-            FROM messages m
-            LEFT JOIN agents a ON m.sender_type = 'agent' AND m.sender_id = a.id
-            LEFT JOIN customers c ON m.sender_type = 'customer' AND m.sender_id = c.id
-            WHERE m.session_id = ?
-            ORDER BY m.timestamp ASC
-        ''', (session_id,))
+        # Get messages for this session dynamically from database
+        messages = db.get_session_messages(session_id)
+        db.release_db_connection(conn)
         
-        messages = cursor.fetchall()
-        conn.close()
+        # Format timestamps
+        for msg in messages:
+            if msg.get('timestamp') and isinstance(msg['timestamp'], datetime):
+                msg['timestamp'] = msg['timestamp'].isoformat()
         
-        ticket_dict['messages'] = [dict(m) for m in messages]
+        ticket_dict['messages'] = messages
         return ticket_dict
     except HTTPException:
         raise
@@ -571,6 +609,33 @@ async def close_session(session_id: int, request: CloseSessionRequest):
     
     return {"status": "success", "message": "Session closed"}
 
+@app.post("/api/sessions/{session_id}/feedback")
+async def submit_feedback(session_id: int, request: FeedbackRequest):
+    """Submit customer feedback and rating for a closed session"""
+    try:
+        # Validate rating
+        if request.rating < 1 or request.rating > 5:
+            raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+        
+        # Update session with feedback
+        conn = db.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE chat_sessions 
+            SET rating = ?, feedback = ?
+            WHERE id = ?
+        ''', (request.rating, request.feedback, session_id))
+        conn.commit()
+        conn.close()
+        
+        print(f"[INFO] Feedback submitted for session {session_id}: {request.rating} stars")
+        return {"status": "success", "message": "Thank you for your feedback!"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Failed to submit feedback: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/agent/quick-replies")
 async def get_quick_replies():
     return {
@@ -585,24 +650,30 @@ async def get_quick_replies():
 # WebSocket Endpoints
 @app.websocket("/ws/customer/{session_id}")
 async def customer_websocket(websocket: WebSocket, session_id: int):
+    print(f"[INFO] 🔌 WebSocket connection attempt for session {session_id}")
     await websocket.accept()
+    print(f"[INFO] ✅ WebSocket accepted for session {session_id}")
     
     # Get session details
     session = db.get_session_by_id(session_id)
     if not session:
+        print(f"[ERROR] ❌ Session {session_id} not found in database")
         await websocket.send_json({"type": "error", "message": "Session not found"})
         await websocket.close()
         return
+    
+    print(f"[INFO] 📋 Session {session_id} found: {session.get('customer_email')}")
     
     # Add customer to active sessions
     if session_id not in manager.active_sessions:
         manager.active_sessions[session_id] = {}
     manager.active_sessions[session_id]['customer'] = websocket
     
-    print(f"[INFO] Customer connected to session {session_id}")
+    print(f"[INFO] 👤 Customer connected to session {session_id}")
     
     # Send chat history
     history = db.get_session_history(session_id)
+    print(f"[INFO] 📜 Sending {len(history)} history messages to customer")
     await websocket.send_json({
         "type": "history",
         "messages": history,
@@ -631,7 +702,14 @@ async def customer_websocket(websocket: WebSocket, session_id: int):
                     await manager.handle_message(session_id, 'customer', session['customer_id'], content)
                     
     except WebSocketDisconnect:
-        print(f"[INFO] Customer disconnected from session {session_id}")
+        print(f"[INFO] 👋 Customer disconnected from session {session_id}")
+        if session_id in manager.active_sessions:
+            if 'customer' in manager.active_sessions[session_id]:
+                del manager.active_sessions[session_id]['customer']
+    except Exception as e:
+        print(f"[ERROR] 🔴 WebSocket error for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
         if session_id in manager.active_sessions:
             if 'customer' in manager.active_sessions[session_id]:
                 del manager.active_sessions[session_id]['customer']
@@ -673,6 +751,23 @@ async def agent_websocket(websocket: WebSocket, username: str):
     except WebSocketDisconnect:
         if agent_id in manager.agent_dashboards:
             del manager.agent_dashboards[agent_id]
+
+@app.get("/api/test/agent/{identifier}")
+async def test_agent_lookup(identifier: str):
+    """Test endpoint to verify agent lookup by username or email"""
+    agent = db.get_agent_by_username(identifier)
+    if agent:
+        return {
+            "found": True,
+            "agent": {
+                "id": agent['id'],
+                "username": agent['username'],
+                "email": agent['email'],
+                "name": agent['name']
+            }
+        }
+    else:
+        return {"found": False, "identifier": identifier}
 
 if __name__ == "__main__":
     import uvicorn

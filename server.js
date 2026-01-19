@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -7,6 +8,9 @@ const path = require('path');
 const { QueueManager } = require('./redis');
 const { getTypeLabel } = require('./issue-categories');
 const dbPG = require('./database-pg');
+
+// Debug: Check what DATABASE_URL is loaded
+console.log('🔍 DATABASE_URL loaded:', process.env.DATABASE_URL ? process.env.DATABASE_URL.substring(0, 50) + '...' : 'NOT FOUND');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,11 +24,12 @@ app.use(cors({
 app.use(express.json());
 
 // Initialize PostgreSQL database
-dbPG.initializeDatabase().catch(err => {
-  console.error('Failed to initialize database:', err);
+dbPG.initializeDatabase().then(() => {
+  console.log('✅ PostgreSQL Database connected and initialized');
+}).catch(err => {
+  console.error('❌ Failed to initialize database:', err.message);
+  console.log('⚠️  Server will continue but database operations will fail');
 });
-
-console.log('✅ PostgreSQL Database initialized');
 
 // In-memory connection tracking
 const connections = {
@@ -37,7 +42,7 @@ const sessionLocks = new Map(); // sessionId -> { locked: boolean, agentEmail: s
 
 function tryLockSession(sessionId, agentEmail) {
   const lock = sessionLocks.get(sessionId);
-  
+
   // Check if already locked
   if (lock && lock.locked) {
     const timeSinceLock = Date.now() - lock.timestamp;
@@ -48,7 +53,7 @@ function tryLockSession(sessionId, agentEmail) {
     }
     console.log(`[Lock] Stale lock detected for session ${sessionId}, overriding`);
   }
-  
+
   // Lock the session
   sessionLocks.set(sessionId, {
     locked: true,
@@ -68,7 +73,7 @@ function unlockSession(sessionId) {
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathParts = url.pathname.split('/').filter(Boolean);
-  
+
   console.log('[WebSocket] New connection:', url.pathname);
 
   if (pathParts[0] === 'ws') {
@@ -98,7 +103,7 @@ wss.on('connection', (ws, req) => {
     } else if (pathParts[1] === 'customer') {
       // Customer connection
       const sessionId = parseInt(pathParts[2]);
-      
+
       // Prevent duplicate connections - close old connection if exists
       if (connections.customers.has(sessionId)) {
         console.log(`[Customer] Duplicate connection attempt for session ${sessionId} - closing old connection`);
@@ -107,7 +112,7 @@ wss.on('connection', (ws, req) => {
           oldWs.close();
         }
       }
-      
+
       connections.customers.set(sessionId, ws);
       console.log(`[Customer] Connected: Session ${sessionId}`);
 
@@ -168,7 +173,7 @@ function handleCustomerMessage(sessionId, message) {
 // Join chat (agent accepts)
 async function joinChat(agentEmail, sessionId) {
   console.log(`[Join Chat] Agent ${agentEmail} attempting to join session ${sessionId}`);
-  
+
   // Try to lock the session
   if (!tryLockSession(sessionId, agentEmail)) {
     // Session already taken by another agent
@@ -183,14 +188,14 @@ async function joinChat(agentEmail, sessionId) {
     console.log(`[Join Chat] Session ${sessionId} already taken, rejected agent ${agentEmail}`);
     return;
   }
-  
+
   const session = await dbPG.getSession(sessionId);
   if (!session) {
     unlockSession(sessionId);
     console.log(`[Join Chat] Session ${sessionId} not found`);
     return;
   }
-  
+
   // Check if session is already assigned
   if (session.status === 'active' && session.agent_email && session.agent_email !== agentEmail) {
     unlockSession(sessionId);
@@ -205,7 +210,7 @@ async function joinChat(agentEmail, sessionId) {
     console.log(`[Join Chat] Session ${sessionId} already assigned to ${session.agent_email}`);
     return;
   }
-  
+
   // Assign session to agent in PostgreSQL
   await dbPG.updateSessionStatus(sessionId, 'active', agentEmail);
 
@@ -232,7 +237,7 @@ async function joinChat(agentEmail, sessionId) {
     readyState: customerWs?.readyState,
     readyStateText: customerWs ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][customerWs.readyState] : 'N/A'
   });
-  
+
   if (customerWs && customerWs.readyState === WebSocket.OPEN) {
     const joinMessage = {
       type: 'agent_joined',
@@ -247,7 +252,7 @@ async function joinChat(agentEmail, sessionId) {
     console.log(`[Join Chat] ERROR: Cannot send agent_joined - Customer WebSocket not available for session ${sessionId}`);
     console.log(`[Join Chat] Active customer connections:`, Array.from(connections.customers.keys()));
   }
-  
+
   // Broadcast to ALL other agents that this chat was taken
   broadcastChatTaken(sessionId, agentEmail);
 
@@ -257,7 +262,7 @@ async function joinChat(agentEmail, sessionId) {
 // Broadcast to all agents that a chat was taken
 function broadcastChatTaken(sessionId, acceptingAgentEmail) {
   console.log(`[Broadcast] Notifying all agents that session ${sessionId} was taken by ${acceptingAgentEmail}`);
-  
+
   connections.agents.forEach((ws, agentEmail) => {
     if (agentEmail !== acceptingAgentEmail && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -352,7 +357,7 @@ async function sendChatHistory(sessionId, ws) {
   try {
     const messages = await dbPG.getMessages(sessionId);
     const session = await dbPG.getSession(sessionId);
-    
+
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'history',
@@ -364,7 +369,7 @@ async function sendChatHistory(sessionId, ws) {
           timestamp: msg.timestamp
         }))
       }));
-      
+
       // If session is already active, notify that agent has joined
       if (session && session.status === 'active' && session.agent_email) {
         const agentName = session.agent_email.split('@')[0];
@@ -394,7 +399,7 @@ async function sendDashboardUpdate(agentEmail) {
       }
     });
     const pending = Array.from(pendingMap.values());
-    
+
     // Get active sessions for this agent from PostgreSQL
     const activeSessions = await dbPG.getActiveSessions(agentEmail);
     // Get unique active sessions (by customer email)
@@ -455,70 +460,91 @@ async function closeSession(sessionId, resolutionNote) {
 
 // Create new chat session
 app.post('/api/sessions', async (req, res) => {
-  const { 
-    customer_name, 
-    customer_email,
-    issue_category = 'general',
-    issue_type = 'other',
-    issue_category_label = 'General Inquiry',
-    issue_type_label = 'Other inquiry'
-  } = req.body;
-  
-  // Check for existing active or pending session for this customer
-  const existingSession = await dbPG.getActiveSessionForCustomer(customer_email);
-  
-  if (existingSession) {
-    console.log(`[Session] Returning existing session ${existingSession.id} for ${customer_email}`);
-    return res.json({ session_id: existingSession.id });
-  }
-  
-  const newSession = await dbPG.createSession(customer_name, customer_email, {
-    category: issue_category,
-    type: issue_type,
-    categoryLabel: issue_category_label,
-    typeLabel: issue_type_label
-  });
+  try {
+    const {
+      customer_name,
+      customer_email,
+      issue_category = 'general',
+      issue_type = 'other',
+      issue_category_label = 'General Inquiry',
+      issue_type_label = 'Other inquiry'
+    } = req.body;
 
-  // Add to Redis queue for better management
-  await QueueManager.addToQueue(
-    newSession.id,
-    issue_category,
-    issue_type_label,
-    {
-      name: customer_name,
-      email: customer_email,
-      category_label: issue_category_label,
-      type_label: issue_type_label
+    // Check for existing active or pending session for this customer
+    const existingSession = await dbPG.getActiveSessionForCustomer(customer_email);
+
+    if (existingSession) {
+      console.log(`[Session] Returning existing session ${existingSession.id} for ${customer_email}`);
+      return res.json({ session_id: existingSession.id });
     }
-  );
 
-  // Notify all connected agents about new pending chat
-  connections.agents.forEach((ws, email) => {
-    sendDashboardUpdate(email);
-  });
+    const newSession = await dbPG.createSession(customer_name, customer_email, {
+      category: issue_category,
+      type: issue_type,
+      categoryLabel: issue_category_label,
+      typeLabel: issue_type_label
+    });
 
-  console.log(`[Session] Created new session ${newSession.id} for ${customer_email} - Issue: ${issue_type_label}`);
-  res.json({ session_id: newSession.id });
+    // Add to Redis queue for better management
+    // Wrap queue operation in try-catch so it doesn't fail the request if redis fails
+    try {
+      await QueueManager.addToQueue(
+        newSession.id,
+        issue_category,
+        issue_type_label,
+        {
+          name: customer_name,
+          email: customer_email,
+          category_label: issue_category_label,
+          type_label: issue_type_label
+        }
+      );
+    } catch (queueError) {
+      console.error('[Redis Error] Failed to add to queue:', queueError);
+      // Continue anyway, session is created in DB
+    }
+
+    // Notify all connected agents about new pending chat
+    connections.agents.forEach((ws, email) => {
+      sendDashboardUpdate(email);
+    });
+
+    console.log(`[Session] Created new session ${newSession.id} for ${customer_email} - Issue: ${issue_type_label}`);
+    res.json({ session_id: newSession.id });
+  } catch (error) {
+    console.error('[API Error] Failed to create session:', error);
+    res.status(500).json({ error: 'Failed to create session' });
+  }
 });
 
 // Get session info
 app.get('/api/sessions/:id', async (req, res) => {
-  const session = await dbPG.getSession(parseInt(req.params.id));
-  res.json(session || {});
+  try {
+    const session = await dbPG.getSession(parseInt(req.params.id));
+    res.json(session || {});
+  } catch (error) {
+    console.error('[API Error] Failed to get session:', error);
+    res.status(500).json({ error: 'Failed to get session' });
+  }
 });
 
 // Check if customer can start new chat
 app.get('/api/customer/can-chat/:email', async (req, res) => {
-  const { email } = req.params;
-  const activeSession = await dbPG.getActiveSessionForCustomer(email);
-  
-  res.json({
-    can_chat: !activeSession,
-    active_session_id: activeSession ? activeSession.id : null,
-    message: activeSession 
-      ? 'You have an active chat session. Please close it before starting a new one.' 
-      : 'You can start a new chat session.'
-  });
+  try {
+    const { email } = req.params;
+    const activeSession = await dbPG.getActiveSessionForCustomer(email);
+
+    res.json({
+      can_chat: !activeSession,
+      active_session_id: activeSession ? activeSession.id : null,
+      message: activeSession
+        ? 'You have an active chat session. Please close it before starting a new one.'
+        : 'You can start a new chat session.'
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to check status:', error);
+    res.status(500).json({ error: 'Failed to check status' });
+  }
 });
 
 // Close session via API
@@ -544,11 +570,11 @@ app.get('/api/agent/quick-replies', (req, res) => {
 // Customer chat history endpoint
 app.get('/api/customer/history/:email', async (req, res) => {
   const { email } = req.params;
-  
+
   try {
     // Find all closed sessions for this customer
     const closedSessions = await dbPG.getClosedSessions(null, email);
-    
+
     // Format for frontend
     const formattedSessions = closedSessions.map(session => ({
       id: session.id,
@@ -563,7 +589,7 @@ app.get('/api/customer/history/:email', async (req, res) => {
       issue_type_label: session.issue_type_label,
       rating: session.rating
     }));
-    
+
     res.json({ sessions: formattedSessions });
   } catch (error) {
     console.error('[API Error] Failed to fetch customer history:', error);
@@ -574,16 +600,16 @@ app.get('/api/customer/history/:email', async (req, res) => {
 // Get ticket history with messages
 app.get('/api/ticket/history/:ticket_id', async (req, res) => {
   const { ticket_id } = req.params;
-  
+
   try {
     const session = await dbPG.getSessionByTicketId(ticket_id);
     if (!session) {
       return res.status(404).json({ error: 'Ticket not found' });
     }
-    
+
     // Get all messages for this session
     const messages = await dbPG.getMessages(session.id);
-    
+
     res.json({
       ...session,
       ticket_id,
@@ -602,11 +628,11 @@ app.get('/api/ticket/history/:ticket_id', async (req, res) => {
 // Agent chat history endpoint
 app.get('/api/agent/history/:username', async (req, res) => {
   const { username } = req.params;
-  
+
   try {
     // Find all closed sessions for this agent
     const closedSessions = await dbPG.getClosedSessions(username);
-    
+
     // Format for frontend
     const formattedSessions = closedSessions.map(session => ({
       id: session.id,
@@ -622,7 +648,7 @@ app.get('/api/agent/history/:username', async (req, res) => {
       issue_type_label: session.issue_type_label,
       rating: session.rating
     }));
-    
+
     res.json({ sessions: formattedSessions });
   } catch (error) {
     console.error('[API Error] Failed to fetch agent history:', error);

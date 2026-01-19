@@ -1,11 +1,12 @@
-const { Pool } = require('pg');
+const { Pool, neonConfig } = require('@neondatabase/serverless');
+const ws = require('ws');
 
-// Neon PostgreSQL connection
+// Configure WebSocket for Node.js environment (Neon serverless requires this)
+neonConfig.webSocketConstructor = ws;
+
+// Neon PostgreSQL connection using serverless driver (bypasses DNS issues with .c-2)
 const pool = new Pool({
-  connectionString: 'postgresql://neondb_owner:npg_l9IKRiHJvBo6@ep-misty-band-adftugtg-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require',
-  ssl: {
-    rejectUnauthorized: false
-  }
+  connectionString: process.env.DATABASE_URL
 });
 
 // Initialize database tables
@@ -72,21 +73,21 @@ async function createSession(customerName, customerEmail, issueData = {}) {
        VALUES ($1, $2, 'pending', $3, $4, $5, $6) 
        RETURNING *`,
       [
-        customerName, 
-        customerEmail, 
+        customerName,
+        customerEmail,
         issueData.category || null,
         issueData.type || null,
         issueData.categoryLabel || null,
         issueData.typeLabel || null
       ]
     );
-    
+
     const session = result.rows[0];
     // Generate ticket ID
     const ticketId = `TICKET-${session.id.toString().padStart(6, '0')}`;
     await client.query('UPDATE chat_sessions SET ticket_id = $1 WHERE id = $2', [ticketId, session.id]);
     session.ticket_id = ticketId;
-    
+
     return session;
   } finally {
     client.release();
@@ -108,12 +109,12 @@ async function updateSessionStatus(sessionId, status, agentEmail = null) {
   try {
     let query = 'UPDATE chat_sessions SET status = $1';
     const params = [status, sessionId];
-    
+
     if (agentEmail) {
       query += ', agent_email = $3, joined_at = CURRENT_TIMESTAMP';
       params.splice(2, 0, agentEmail);
     }
-    
+
     query += ' WHERE id = $2 RETURNING *';
     const result = await client.query(query, params);
     return result.rows[0];
@@ -155,12 +156,12 @@ async function getActiveSessions(agentEmail = null) {
   try {
     let query = "SELECT * FROM chat_sessions WHERE status = 'active'";
     const params = [];
-    
+
     if (agentEmail) {
       query += " AND agent_email = $1";
       params.push(agentEmail);
     }
-    
+
     query += " ORDER BY joined_at DESC";
     const result = await client.query(query, params);
     return result.rows;
@@ -175,19 +176,19 @@ async function getClosedSessions(agentEmail = null, customerEmail = null) {
     let query = "SELECT * FROM chat_sessions WHERE status = 'closed'";
     const params = [];
     let paramIndex = 1;
-    
+
     if (agentEmail) {
       query += ` AND agent_email = $${paramIndex}`;
       params.push(agentEmail);
       paramIndex++;
     }
-    
+
     if (customerEmail) {
       query += ` AND customer_email = $${paramIndex}`;
       params.push(customerEmail);
       paramIndex++;
     }
-    
+
     query += " ORDER BY closed_at DESC";
     const result = await client.query(query, params);
     return result.rows;
