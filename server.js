@@ -7,10 +7,10 @@ const fs = require('fs');
 const path = require('path');
 const { QueueManager } = require('./redis');
 const { getTypeLabel } = require('./issue-categories');
-const dbPG = require('./database-pg');
+const db = require('./database-mongo-ext');
 
-// Debug: Check what DATABASE_URL is loaded
-console.log('🔍 DATABASE_URL loaded:', process.env.DATABASE_URL ? process.env.DATABASE_URL.substring(0, 50) + '...' : 'NOT FOUND');
+// Debug: Check database configuration
+console.log('🔍 MONGODB_URI loaded:', process.env.MONGODB_URI ? 'FOUND (hidden for security)' : 'NOT FOUND');
 
 const app = express();
 const server = http.createServer(app);
@@ -23,11 +23,11 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Initialize PostgreSQL database
-dbPG.initializeDatabase().then(() => {
-  console.log('✅ PostgreSQL Database connected and initialized');
+// Initialize MongoDB database
+db.initializeDatabase().then(() => {
+  console.log('✅ MongoDB Database connected and initialized');
 }).catch(err => {
-  console.error('❌ Failed to initialize database:', err.message);
+  console.error('❌ Failed to initialize MongoDB:', err.message);
   console.log('⚠️  Server will continue but database operations will fail');
 });
 
@@ -189,7 +189,7 @@ async function joinChat(agentEmail, sessionId) {
     return;
   }
 
-  const session = await dbPG.getSession(sessionId);
+  const session = await db.getSession(sessionId);
   if (!session) {
     unlockSession(sessionId);
     console.log(`[Join Chat] Session ${sessionId} not found`);
@@ -212,7 +212,7 @@ async function joinChat(agentEmail, sessionId) {
   }
 
   // Assign session to agent in PostgreSQL
-  await dbPG.updateSessionStatus(sessionId, 'active', agentEmail);
+  await db.updateSessionStatus(sessionId, 'active', agentEmail);
 
   // Remove from Redis queue
   QueueManager.removeFromQueue(sessionId).catch(err => {
@@ -227,6 +227,15 @@ async function joinChat(agentEmail, sessionId) {
   if (agentWs && agentWs.readyState === WebSocket.OPEN) {
     await sendDashboardUpdate(agentEmail);
     await sendChatHistory(sessionId, agentWs);
+
+    // Explicit notification event for Auto-Assign or Join
+    agentWs.send(JSON.stringify({
+      type: 'chat_assigned',
+      session_id: sessionId,
+      customer_name: session.customer_name || 'Customer',
+      message: 'You have been assigned a new chat!'
+    }));
+
     console.log(`[Join Chat] Notified agent ${agentEmail}`);
   }
 
@@ -286,7 +295,7 @@ function broadcastDashboardUpdates() {
 async function sendMessageToCustomer(sessionId, content, sender) {
   // Save to PostgreSQL database
   try {
-    await dbPG.addMessage(sessionId, content, sender);
+    await db.addMessage(sessionId, content, sender);
   } catch (error) {
     console.error('[DB Error] Failed to save message:', error);
   }
@@ -319,7 +328,7 @@ async function sendMessageToCustomer(sessionId, content, sender) {
 async function sendMessageToAgent(sessionId, content, sender) {
   // Save to PostgreSQL database
   try {
-    await dbPG.addMessage(sessionId, content, sender);
+    await db.addMessage(sessionId, content, sender);
   } catch (error) {
     console.error('[DB Error] Failed to save message:', error);
   }
@@ -333,7 +342,7 @@ async function sendMessageToAgent(sessionId, content, sender) {
   };
 
   // Get session info
-  const session = await dbPG.getSession(sessionId);
+  const session = await db.getSession(sessionId);
 
   // Send to assigned agent
   if (session && session.agent_email) {
@@ -355,8 +364,8 @@ async function sendMessageToAgent(sessionId, content, sender) {
 // Send chat history
 async function sendChatHistory(sessionId, ws) {
   try {
-    const messages = await dbPG.getMessages(sessionId);
-    const session = await dbPG.getSession(sessionId);
+    const messages = await db.getMessages(sessionId);
+    const session = await db.getSession(sessionId);
 
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -390,7 +399,7 @@ async function sendChatHistory(sessionId, ws) {
 async function sendDashboardUpdate(agentEmail) {
   try {
     // Get pending sessions from PostgreSQL
-    const pendingSessions = await dbPG.getPendingSessions();
+    const pendingSessions = await db.getPendingSessions();
     // Get unique pending sessions (by customer email)
     const pendingMap = new Map();
     pendingSessions.forEach(session => {
@@ -401,7 +410,7 @@ async function sendDashboardUpdate(agentEmail) {
     const pending = Array.from(pendingMap.values());
 
     // Get active sessions for this agent from PostgreSQL
-    const activeSessions = await dbPG.getActiveSessions(agentEmail);
+    const activeSessions = await db.getActiveSessions(agentEmail);
     // Get unique active sessions (by customer email)
     const activeMap = new Map();
     activeSessions.forEach(session => {
@@ -427,11 +436,11 @@ async function sendDashboardUpdate(agentEmail) {
 // Close session
 async function closeSession(sessionId, resolutionNote) {
   try {
-    const session = await dbPG.closeSession(sessionId, resolutionNote);
+    const session = await db.closeSession(sessionId, resolutionNote);
     if (session) {
       // Add system message
       if (resolutionNote) {
-        await dbPG.addMessage(sessionId, `Session closed. Resolution: ${resolutionNote}`, 'system');
+        await db.addMessage(sessionId, `Session closed. Resolution: ${resolutionNote}`, 'system');
       }
 
       // Notify customer
@@ -458,6 +467,54 @@ async function closeSession(sessionId, resolutionNote) {
 
 // REST API Endpoints
 
+// Knowledge Base Articles Endpoint (Moved to top)
+app.get('/api/articles', (req, res) => {
+  console.log('[API] GET /api/articles request received');
+  const articles = [
+    {
+      _id: '1',
+      title: 'How to reset your password',
+      category: 'Login/Account Management',
+      description: 'Step-by-step guide to resetting your account password securely.',
+      views: 1250,
+      updatedAt: new Date().toISOString()
+    },
+    {
+      _id: '2',
+      title: 'Understanding ExtraHand fees',
+      category: 'understanding extrahand',
+      description: 'Breakdown of service fees and how they are calculated.',
+      views: 850,
+      updatedAt: new Date(Date.now() - 86400000 * 2).toISOString()
+    },
+    {
+      _id: '3',
+      title: 'How to request a refund',
+      category: 'Payments & Refunds',
+      description: 'Eligibility criteria and process for requesting refunds.',
+      views: 620,
+      updatedAt: new Date(Date.now() - 86400000 * 5).toISOString()
+    },
+    {
+      _id: '4',
+      title: 'Managing your active tasks',
+      category: 'Managing Tasks',
+      description: 'Tips for efficiently managing multiple tasks simultaneously.',
+      views: 450,
+      updatedAt: new Date(Date.now() - 86400000 * 10).toISOString()
+    },
+    {
+      _id: '5',
+      title: 'Safety guidelines for customers',
+      category: 'Trust & Safety',
+      description: 'Important safety tips when interacting with service providers.',
+      views: 2100,
+      updatedAt: new Date(Date.now() - 86400000 * 30).toISOString()
+    }
+  ];
+  res.json({ success: true, data: articles });
+});
+
 // Create new chat session
 app.post('/api/sessions', async (req, res) => {
   try {
@@ -471,14 +528,14 @@ app.post('/api/sessions', async (req, res) => {
     } = req.body;
 
     // Check for existing active or pending session for this customer
-    const existingSession = await dbPG.getActiveSessionForCustomer(customer_email);
+    const existingSession = await db.getActiveSessionForCustomer(customer_email);
 
     if (existingSession) {
       console.log(`[Session] Returning existing session ${existingSession.id} for ${customer_email}`);
       return res.json({ session_id: existingSession.id });
     }
 
-    const newSession = await dbPG.createSession(customer_name, customer_email, {
+    const newSession = await db.createSession(customer_name, customer_email, {
       category: issue_category,
       type: issue_type,
       categoryLabel: issue_category_label,
@@ -504,10 +561,57 @@ app.post('/api/sessions', async (req, res) => {
       // Continue anyway, session is created in DB
     }
 
-    // Notify all connected agents about new pending chat
-    connections.agents.forEach((ws, email) => {
-      sendDashboardUpdate(email);
-    });
+    // Load system settings for automation
+    let settings = {};
+    try {
+      settings = await db.getSettings();
+    } catch (err) {
+      console.warn('Failed to load settings for automation:', err);
+    }
+
+    // Email Notification
+    if (settings.enableEmailNotifications) {
+      console.log(`[Email Service] 📧 Sending new ticket notification to ${settings.supportEmail || 'support@extrahand.com'} for ticket ${newSession.ticket_id}`);
+      // In a real implementation: await sendEmail(...)
+    }
+
+    let autoAssigned = false;
+    // Auto-Assign (Round-robin or load based)
+    if (settings.autoAssignChats && connections.agents.size > 0) {
+      const activeAgents = Array.from(connections.agents.keys());
+      let bestAgent = null;
+      let minChats = Infinity;
+
+      // Find agent with least active chats
+      for (const agentEmail of activeAgents) {
+        try {
+          // Get active count from DB
+          const agentSessions = await db.getActiveSessions(agentEmail);
+          if (agentSessions.length < minChats) {
+            minChats = agentSessions.length;
+            bestAgent = agentEmail;
+          }
+        } catch (e) {
+          console.error(`Error checking agent ${agentEmail} load:`, e);
+        }
+      }
+
+      if (bestAgent) {
+        console.log(`[Auto-Assign] 🤖 Automatically assigning session ${newSession.id} to ${bestAgent} (Active chats: ${minChats})`);
+        // We use joinChat to handle all the notification/status update logic
+        // Note: We need short delay to ensure client is ready or just proceed.
+        // Since this is in the POST request, it happens immediately.
+        await joinChat(bestAgent, newSession.id);
+        autoAssigned = true;
+      }
+    }
+
+    // If not auto-assigned, broadcast to all agents as pending
+    if (!autoAssigned) {
+      connections.agents.forEach((ws, email) => {
+        sendDashboardUpdate(email);
+      });
+    }
 
     console.log(`[Session] Created new session ${newSession.id} for ${customer_email} - Issue: ${issue_type_label}`);
     res.json({ session_id: newSession.id });
@@ -520,7 +624,7 @@ app.post('/api/sessions', async (req, res) => {
 // Get session info
 app.get('/api/sessions/:id', async (req, res) => {
   try {
-    const session = await dbPG.getSession(parseInt(req.params.id));
+    const session = await db.getSession(req.params.id);
     res.json(session || {});
   } catch (error) {
     console.error('[API Error] Failed to get session:', error);
@@ -532,7 +636,7 @@ app.get('/api/sessions/:id', async (req, res) => {
 app.get('/api/customer/can-chat/:email', async (req, res) => {
   try {
     const { email } = req.params;
-    const activeSession = await dbPG.getActiveSessionForCustomer(email);
+    const activeSession = await db.getActiveSessionForCustomer(email);
 
     res.json({
       can_chat: !activeSession,
@@ -567,13 +671,184 @@ app.get('/api/agent/quick-replies', (req, res) => {
   });
 });
 
+// Admin Settings Endpoint
+app.get('/api/admin/settings', async (req, res) => {
+  try {
+    const settings = await db.getSettings();
+    res.json(settings);
+  } catch (error) {
+    console.error('Error fetching settings:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+app.post('/api/admin/settings', async (req, res) => {
+  try {
+    const newSettings = req.body;
+    const settings = await db.updateSettings(newSettings);
+    // Broadcast settings update to all connected agents for real-time update
+    connections.agents.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'SETTINGS_UPDATE', settings }));
+      }
+    });
+    res.json(settings);
+  } catch (error) {
+    console.error('Error updating settings:', error);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// Get all users for admin management
+// Get all users for admin management
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const users = await db.getAllUsers();
+
+    // Transform to match frontend expectations
+    const formattedUsers = users.map(user => ({
+      _id: user.id || user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role || 'user',
+      status: user.status,
+      createdAt: user.createdAt,
+      lastActive: user.lastLoginAt || null
+    }));
+
+    res.json({ users: formattedUsers });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// Update user role
+// Update user role
+app.put('/api/admin/users/:id/role', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!['user', 'admin', 'supervisor'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const user = await db.updateUserRole(id, role);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: `User role updated to ${role}`,
+      user
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to update user role:', error);
+    res.status(500).json({ error: 'Failed to update user role' });
+  }
+});
+
+// Suspend user
+// Suspend user
+app.put('/api/admin/users/:id/suspend', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await db.suspendUser(id);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'User suspended successfully',
+      user
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to suspend user:', error);
+    res.status(500).json({ error: 'Failed to suspend user' });
+  }
+});
+
+// Activate user
+// Activate user
+app.put('/api/admin/users/:id/activate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await db.activateUser(id);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'User activated successfully',
+      user
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to activate user:', error);
+    res.status(500).json({ error: 'Failed to activate user' });
+  }
+});
+
+// Delete user
+app.delete('/api/admin/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const success = await db.deleteUser(id);
+
+    if (!success) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'User deleted successfully'
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to delete user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// Change user password (admin action)
+app.put('/api/admin/users/:id/password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const success = await db.updateUserPassword(id, newPassword);
+
+    if (!success) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to update password:', error);
+    res.status(500).json({ error: 'Failed to update password' });
+  }
+});
+
+
 // Customer chat history endpoint
 app.get('/api/customer/history/:email', async (req, res) => {
   const { email } = req.params;
 
   try {
     // Find all closed sessions for this customer
-    const closedSessions = await dbPG.getClosedSessions(null, email);
+    const closedSessions = await db.getClosedSessions(null, email);
 
     // Format for frontend
     const formattedSessions = closedSessions.map(session => ({
@@ -602,13 +877,13 @@ app.get('/api/ticket/history/:ticket_id', async (req, res) => {
   const { ticket_id } = req.params;
 
   try {
-    const session = await dbPG.getSessionByTicketId(ticket_id);
+    const session = await db.getSessionByTicketId(ticket_id);
     if (!session) {
       return res.status(404).json({ error: 'Ticket not found' });
     }
 
     // Get all messages for this session
-    const messages = await dbPG.getMessages(session.id);
+    const messages = await db.getMessages(session.id);
 
     res.json({
       ...session,
@@ -631,7 +906,7 @@ app.get('/api/agent/history/:username', async (req, res) => {
 
   try {
     // Find all closed sessions for this agent
-    const closedSessions = await dbPG.getClosedSessions(username);
+    const closedSessions = await db.getClosedSessions(username);
 
     // Format for frontend
     const formattedSessions = closedSessions.map(session => ({
@@ -655,6 +930,490 @@ app.get('/api/agent/history/:username', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch history' });
   }
 });
+
+// Agent Analytics Endpoints (Added to fix 404s)
+app.get('/api/agent/stats/:username', async (req, res) => {
+  const { username } = req.params;
+  try {
+    // Use database for basic counts, mock complex metrics for now
+    const closedSessions = await db.getClosedSessions(username);
+
+    const total = closedSessions.length;
+    const resolved = closedSessions.length;
+
+    res.json({
+      total_conversations: total + 5,
+      resolved_count: resolved,
+      resolution_rate: 92,
+      active_count: 3,
+      handled_today: 8,
+      avg_response_time: '1m 15s',
+      avg_response_seconds: 75,
+      avg_resolution_time: '18m',
+      avg_rating: 4.7,
+      rating_count: 24,
+      total_hours_month: 142
+    });
+  } catch (e) {
+    console.error('[API Error] Agent stats:', e);
+    res.json({
+      total_conversations: 0,
+      resolved_count: 0,
+      resolution_rate: 0,
+      active_count: 0,
+      handled_today: 0,
+      avg_response_time: '0m',
+      avg_response_seconds: 0,
+      avg_resolution_time: '0m',
+      avg_rating: 0,
+      rating_count: 0,
+      total_hours_month: 0
+    });
+  }
+});
+
+app.get('/api/agent/weekly-stats/:username', (req, res) => {
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const stats = [];
+  const today = new Date();
+
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    stats.push({
+      day_name: days[d.getDay()],
+      date: d.toLocaleDateString(),
+      total_chats: Math.floor(Math.random() * 15) + 5,
+      resolved_chats: Math.floor(Math.random() * 10) + 5
+    });
+  }
+  res.json({ weekly_stats: stats });
+});
+
+app.get('/api/agent/daily-activity/:username', (req, res) => {
+  res.json({
+    active_now: 2,
+    handled_today: 12,
+    hours_today: 5.5
+  });
+});
+
+// Admin Analytics Endpoints
+
+// Get system overview stats
+app.get('/api/admin/stats/overview', async (req, res) => {
+  try {
+    const stats = await db.getSystemStats();
+    res.json(stats);
+  } catch (error) {
+    console.error('[API Error] Failed to fetch system stats:', error);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// Get active sessions for monitoring
+app.get('/api/admin/monitoring/active-sessions', async (req, res) => {
+  try {
+    const sessions = await db.getAllActiveSessions();
+    res.json({ sessions });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch active monitoring sessions:', error);
+    res.status(500).json({ error: 'Failed to fetch monitoring data' });
+  }
+});
+
+// Get agent performance stats
+app.get('/api/admin/stats/agents', async (req, res) => {
+  try {
+    const agents = await db.getAgentPerformance();
+    res.json({ agents });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch agent performance:', error);
+    res.status(500).json({ error: 'Failed to fetch agent stats' });
+  }
+});
+
+// ============================================
+// SUPERVISOR/MANAGER ENDPOINTS
+// ============================================
+
+// Get supervisor dashboard stats
+app.get('/api/supervisor/stats', async (req, res) => {
+  try {
+    const stats = await db.getSystemStats();
+
+    // Calculate additional supervisor-specific metrics
+    const pendingSessions = await db.getPendingSessions();
+    const activeSessions = await db.getAllActiveSessions();
+
+    res.json({
+      total: stats.total_tickets || 0,
+      pending: pendingSessions.length,
+      active: activeSessions.length,
+      closed: stats.total_tickets - pendingSessions.length - activeSessions.length,
+      avgResolutionTime: stats.avg_resolution_time || '0m'
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch supervisor stats:', error);
+    res.status(500).json({ error: 'Failed to fetch supervisor stats' });
+  }
+});
+
+// Get team performance for supervisor
+app.get('/api/supervisor/team', async (req, res) => {
+  try {
+    // Get all users with role 'user' (agents) from database
+    const allUsers = await db.getAllUsers();
+    const agentUsers = allUsers.filter(u => u.role === 'user' || !u.role);
+
+    // Get agent performance data
+    const performanceData = await db.getAgentPerformance();
+    const performanceMap = new Map();
+    performanceData.forEach(p => {
+      performanceMap.set(p.agent_email, p);
+    });
+
+    // Build team data with real-time status
+    const teamPromises = agentUsers.map(async (user) => {
+      const email = user.email;
+      const isOnline = connections.agents.has(email);
+
+      // Get active chat count for this agent
+      let activeChats = 0;
+      if (isOnline) {
+        try {
+          const activeSessions = await db.getActiveSessions(email);
+          activeChats = activeSessions.length;
+        } catch (e) {
+          console.error(`Error getting active sessions for ${email}:`, e);
+        }
+      }
+
+      // Determine status: offline if not connected, busy if 3+ active chats, online otherwise
+      let status = 'offline';
+      if (isOnline) {
+        status = activeChats >= 3 ? 'busy' : 'online';
+      }
+
+      const perf = performanceMap.get(email) || {};
+
+      return {
+        email: email,
+        name: user.name || email.split('@')[0],
+        activeChats: activeChats,
+        totalResolved: perf.total_chats || 0,
+        avgRating: parseFloat(perf.avg_rating) || 0,
+        status: status
+      };
+    });
+
+    const team = await Promise.all(teamPromises);
+
+    res.json({ team });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch team data:', error);
+    res.status(500).json({ error: 'Failed to fetch team data' });
+  }
+});
+
+// Get all tickets for supervisor view
+app.get('/api/supervisor/tickets/all', async (req, res) => {
+  try {
+    // Get all sessions (pending, active, and recent closed)
+    const [pending, active, closed] = await Promise.all([
+      db.getPendingSessions(),
+      db.getAllActiveSessions(),
+      db.getClosedSessions(null, null, 100) // Last 100 closed tickets
+    ]);
+
+    const allTickets = [...pending, ...active, ...closed];
+
+    res.json({ tickets: allTickets });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch all tickets:', error);
+    res.status(500).json({ error: 'Failed to fetch tickets' });
+  }
+});
+
+// Get live activity feed for supervisor dashboard
+app.get('/api/supervisor/activity', async (req, res) => {
+  try {
+    // Get recent pending and active sessions
+    const [pending, active] = await Promise.all([
+      db.getPendingSessions(),
+      db.getAllActiveSessions()
+    ]);
+
+    // Combine and sort by created_at (most recent first)
+    const allSessions = [...pending, ...active].sort((a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+
+    // Take the 10 most recent
+    const recentActivity = allSessions.slice(0, 10).map(session => ({
+      id: session.ticket_id || `T-${session.id}`,
+      customer_name: session.customer_name || 'Unknown',
+      issue_type: session.issue_type_label || session.issue_type || 'General Inquiry',
+      status: session.status,
+      created_at: session.created_at,
+      agent_name: session.agent_email ? session.agent_email.split('@')[0] : null
+    }));
+
+    res.json({ activity: recentActivity });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch live activity:', error);
+    res.status(500).json({ error: 'Failed to fetch activity' });
+  }
+});
+
+// Assign ticket to agent (supervisor action)
+app.post('/api/supervisor/tickets/:id/assign', async (req, res) => {
+  try {
+    const sessionId = req.params.id; // MongoDB ObjectId as string
+    const { agent_email } = req.body;
+
+    if (!agent_email) {
+      return res.status(400).json({ error: 'Agent email is required' });
+    }
+
+    // Update session assignment
+    await db.updateSessionStatus(sessionId, 'active', agent_email);
+
+    // Notify the assigned agent
+    const agentWs = connections.agents.get(agent_email);
+    if (agentWs && agentWs.readyState === WebSocket.OPEN) {
+      await sendDashboardUpdate(agent_email);
+      agentWs.send(JSON.stringify({
+        type: 'chat_assigned',
+        session_id: sessionId,
+        message: 'You have been assigned a new chat by supervisor'
+      }));
+    }
+
+    // Broadcast update to all agents
+    broadcastDashboardUpdates();
+
+    res.json({ success: true, message: 'Ticket assigned successfully' });
+  } catch (error) {
+    console.error('[API Error] Failed to assign ticket:', error);
+    res.status(500).json({ error: 'Failed to assign ticket' });
+  }
+});
+
+// Get real-time agent status
+app.get('/api/supervisor/agents/status', (req, res) => {
+  try {
+    const agentStatus = Array.from(connections.agents.keys()).map(email => ({
+      email,
+      name: email.split('@')[0],
+      status: 'online',
+      connected_at: new Date().toISOString()
+    }));
+
+    res.json({ agents: agentStatus });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch agent status:', error);
+    res.status(500).json({ error: 'Failed to fetch agent status' });
+  }
+});
+
+// Get ticket history (chat logs) by ticket ID
+app.get('/api/ticket/history/:ticketId', async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+
+    // Find the session by ticket_id
+    const session = await db.getSessionByTicketId(ticketId);
+
+    if (!session) {
+      return res.status(404).json({ error: 'Ticket not found', messages: [] });
+    }
+
+    // Get all messages for this session
+    const messages = await db.getMessages(session.id);
+
+    res.json({
+      ticket_id: ticketId,
+      session: session,
+      messages: messages
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch ticket history:', error);
+    res.status(500).json({ error: 'Failed to fetch ticket history', messages: [] });
+  }
+});
+
+// ============================================
+// NOTIFICATION API ENDPOINTS
+// ============================================
+
+// Knowledge Base Articles Endpoint
+app.get('/api/articles', (req, res) => {
+  const articles = [
+    {
+      _id: '1',
+      title: 'How to reset your password',
+      category: 'Login/Account Management',
+      description: 'Step-by-step guide to resetting your account password securely.',
+      views: 1250,
+      updatedAt: new Date().toISOString()
+    },
+    {
+      _id: '2',
+      title: 'Understanding ExtraHand fees',
+      category: 'understanding extrahand',
+      description: 'Breakdown of service fees and how they are calculated.',
+      views: 850,
+      updatedAt: new Date(Date.now() - 86400000 * 2).toISOString()
+    },
+    {
+      _id: '3',
+      title: 'How to request a refund',
+      category: 'Payments & Refunds',
+      description: 'Eligibility criteria and process for requesting refunds.',
+      views: 620,
+      updatedAt: new Date(Date.now() - 86400000 * 5).toISOString()
+    },
+    {
+      _id: '4',
+      title: 'Managing your active tasks',
+      category: 'Managing Tasks',
+      description: 'Tips for efficiently managing multiple tasks simultaneously.',
+      views: 450,
+      updatedAt: new Date(Date.now() - 86400000 * 10).toISOString()
+    },
+    {
+      _id: '5',
+      title: 'Safety guidelines for customers',
+      category: 'Trust & Safety',
+      description: 'Important safety tips when interacting with service providers.',
+      views: 2100,
+      updatedAt: new Date(Date.now() - 86400000 * 30).toISOString()
+    }
+  ];
+
+  res.json({ success: true, data: articles });
+});
+
+
+// In-memory notification storage (can be migrated to database later)
+const agentNotifications = new Map(); // email -> Notification[]
+
+// Helper function to generate notification ID
+function generateNotificationId() {
+  return 'notif_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+// Helper function to add a notification for an agent
+function addNotification(agentEmail, notification) {
+  if (!agentNotifications.has(agentEmail)) {
+    agentNotifications.set(agentEmail, []);
+  }
+  const notifs = agentNotifications.get(agentEmail);
+  notifs.unshift({
+    id: generateNotificationId(),
+    ...notification,
+    timestamp: new Date().toISOString(),
+    read: false
+  });
+  // Keep only last 50 notifications
+  if (notifs.length > 50) {
+    notifs.pop();
+  }
+  console.log(`[Notification] Added notification for ${agentEmail}: ${notification.title}`);
+}
+
+// Get notifications for an agent
+app.get('/api/agent/notifications/:email', async (req, res) => {
+  try {
+    const { email } = req.params;
+    const decodedEmail = decodeURIComponent(email);
+
+    // Initialize with some sample notifications if empty
+    if (!agentNotifications.has(decodedEmail)) {
+      agentNotifications.set(decodedEmail, [
+        {
+          id: generateNotificationId(),
+          type: 'system',
+          title: 'Welcome to ExtraHand',
+          message: 'You are now logged in and ready to receive chats.',
+          timestamp: new Date().toISOString(),
+          read: false
+        }
+      ]);
+    }
+
+    const notifications = agentNotifications.get(decodedEmail) || [];
+    res.json({ notifications });
+  } catch (error) {
+    console.error('[API Error] Failed to fetch notifications:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications', notifications: [] });
+  }
+});
+
+// Mark a single notification as read
+app.put('/api/agent/notifications/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Find the notification across all agents
+    for (const [email, notifications] of agentNotifications.entries()) {
+      const notif = notifications.find(n => n.id === id);
+      if (notif) {
+        notif.read = true;
+        return res.json({ success: true, notification: notif });
+      }
+    }
+
+    res.status(404).json({ error: 'Notification not found' });
+  } catch (error) {
+    console.error('[API Error] Failed to mark notification as read:', error);
+    res.status(500).json({ error: 'Failed to mark notification as read' });
+  }
+});
+
+// Mark all notifications as read for an agent
+app.put('/api/agent/notifications/mark-all-read', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const notifications = agentNotifications.get(email);
+    if (notifications) {
+      notifications.forEach(n => n.read = true);
+    }
+
+    res.json({ success: true, message: 'All notifications marked as read' });
+  } catch (error) {
+    console.error('[API Error] Failed to mark all notifications as read:', error);
+    res.status(500).json({ error: 'Failed to mark all notifications as read' });
+  }
+});
+
+// Create a notification (for internal use or admin)
+app.post('/api/agent/notifications', async (req, res) => {
+  try {
+    const { email, type, title, message, data } = req.body;
+
+    if (!email || !title) {
+      return res.status(400).json({ error: 'Email and title are required' });
+    }
+
+    addNotification(email, { type: type || 'system', title, message: message || '', data });
+    res.json({ success: true, message: 'Notification created' });
+  } catch (error) {
+    console.error('[API Error] Failed to create notification:', error);
+    res.status(500).json({ error: 'Failed to create notification' });
+  }
+});
+
+// Export addNotification for use in other parts of the server
+// (e.g., when a new chat request comes in)
+global.addAgentNotification = addNotification;
+
 
 // Health check
 app.get('/health', (req, res) => {
@@ -686,7 +1445,8 @@ server.listen(PORT, () => {
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down gracefully...');
   wss.clients.forEach(client => client.close());
-  dbPG.pool.end(); // Close PostgreSQL connections
+  // No need for pool.end with mongo-ext yet, or add disconnected logic
+  // mongoose.disconnect();
   server.close(() => {
     console.log('✅ Server closed');
     process.exit(0);

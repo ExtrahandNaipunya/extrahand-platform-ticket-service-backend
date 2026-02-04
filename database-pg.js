@@ -54,6 +54,33 @@ async function initializeDatabase() {
       CREATE INDEX IF NOT EXISTS idx_messages_session_id ON chat_messages(session_id);
     `);
 
+    // Create system_settings table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(255) PRIMARY KEY,
+        value JSONB NOT NULL
+      )
+    `);
+
+    // Insert default settings if empty
+    const settingsCheck = await client.query('SELECT COUNT(*) FROM system_settings');
+    if (parseInt(settingsCheck.rows[0].count) === 0) {
+      const defaultSettings = {
+        siteName: 'ExtraHand Support',
+        supportEmail: 'support@extrahand.com',
+        operatingHours: '9:00 AM - 6:00 PM',
+        timezone: 'Asia/Kolkata (IST)',
+        enableEmailNotifications: true,
+        enableSoundAlerts: true,
+        autoAssignChats: true,
+        maintenanceMode: false
+      };
+
+      for (const [key, value] of Object.entries(defaultSettings)) {
+        await client.query('INSERT INTO system_settings (key, value) VALUES ($1, $2)', [key, JSON.stringify(value)]);
+      }
+    }
+
     console.log('✅ PostgreSQL database initialized');
   } catch (error) {
     console.error('❌ Error initializing database:', error);
@@ -170,7 +197,7 @@ async function getActiveSessions(agentEmail = null) {
   }
 }
 
-async function getClosedSessions(agentEmail = null, customerEmail = null) {
+async function getClosedSessions(agentEmail = null, customerEmail = null, limit = null) {
   const client = await pool.connect();
   try {
     let query = "SELECT * FROM chat_sessions WHERE status = 'closed'";
@@ -190,6 +217,11 @@ async function getClosedSessions(agentEmail = null, customerEmail = null) {
     }
 
     query += " ORDER BY closed_at DESC";
+
+    if (limit) {
+      query += ` LIMIT ${parseInt(limit)}`;
+    }
+
     const result = await client.query(query, params);
     return result.rows;
   } finally {
@@ -248,6 +280,145 @@ async function getActiveSessionForCustomer(customerEmail) {
   }
 }
 
+// Analytics operations
+async function getSystemStats() {
+  const client = await pool.connect();
+  try {
+    // 1. Total Tickets Count
+    const totalTicketsResult = await client.query('SELECT COUNT(*) FROM chat_sessions');
+    const totalTickets = parseInt(totalTicketsResult.rows[0].count);
+
+    // 2. Active Agents Count
+    const activeAgentsResult = await client.query('SELECT COUNT(DISTINCT agent_email) FROM chat_sessions WHERE status = \'active\' AND agent_email IS NOT NULL');
+    const activeAgents = parseInt(activeAgentsResult.rows[0].count);
+
+    // 3. Avg Resolution Time
+    const resolutionTimeResult = await client.query(`
+      SELECT AVG(EXTRACT(EPOCH FROM (closed_at - joined_at))) as avg_seconds
+      FROM chat_sessions 
+      WHERE status = 'closed' AND joined_at IS NOT NULL AND closed_at IS NOT NULL
+    `);
+    const avgResolutionSeconds = resolutionTimeResult.rows[0].avg_seconds || 0;
+    const minutes = Math.floor(avgResolutionSeconds / 60);
+    const avgResolutionTime = `${minutes}m ${Math.round(avgResolutionSeconds % 60)}s`;
+
+    // 4. Ticket Status Breakdown
+    const statusResult = await client.query(`
+      SELECT status, COUNT(*) as count 
+      FROM chat_sessions 
+      GROUP BY status
+    `);
+    const statusBreakdown = {
+      pending: 0,
+      active: 0,
+      closed: 0
+    };
+    statusResult.rows.forEach(row => {
+      if (statusBreakdown[row.status] !== undefined) {
+        statusBreakdown[row.status] = parseInt(row.count);
+      }
+    });
+
+    // 5. Recent Activity (Last 5 tickets created)
+    const recentActivityResult = await client.query(`
+      SELECT id, customer_name, status, created_at, issue_type_label 
+      FROM chat_sessions 
+      ORDER BY created_at DESC 
+      LIMIT 5
+    `);
+
+    return {
+      total_tickets: totalTickets,
+      active_agents: activeAgents,
+      avg_resolution_time: avgResolutionTime,
+      status_breakdown: statusBreakdown,
+      recent_activity: recentActivityResult.rows
+    };
+  } finally {
+    client.release();
+  }
+}
+
+async function getAgentPerformance() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT 
+        agent_email,
+        COUNT(*) as total_chats,
+        AVG(rating) as avg_rating,
+        AVG(EXTRACT(EPOCH FROM (closed_at - joined_at))) as avg_duration_seconds
+      FROM chat_sessions
+      WHERE agent_email IS NOT NULL AND status = 'closed'
+      GROUP BY agent_email
+      ORDER BY total_chats DESC
+    `);
+
+    return result.rows.map(row => ({
+      agent_email: row.agent_email,
+      total_chats: parseInt(row.total_chats),
+      avg_rating: row.avg_rating ? parseFloat(row.avg_rating).toFixed(1) : 'N/A',
+      avg_duration: row.avg_duration_seconds
+        ? `${Math.floor(row.avg_duration_seconds / 60)}m`
+        : 'N/A'
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+async function getAllActiveSessions() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT cs.*, 
+        (SELECT content FROM chat_messages WHERE session_id = cs.id ORDER BY timestamp DESC LIMIT 1) as last_message,
+        (SELECT sender_type FROM chat_messages WHERE session_id = cs.id ORDER BY timestamp DESC LIMIT 1) as last_sender
+      FROM chat_sessions cs
+      WHERE cs.status = 'active'
+      ORDER BY cs.joined_at DESC
+    `);
+    return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
+// Settings operations
+async function getSettings() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query('SELECT * FROM system_settings');
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = row.value;
+    });
+    return settings;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateSettings(newSettings) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [key, value] of Object.entries(newSettings)) {
+      await client.query(
+        'INSERT INTO system_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
+        [key, JSON.stringify(value)]
+      );
+    }
+    await client.query('COMMIT');
+    return await getSettings();
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   pool,
   initializeDatabase,
@@ -261,5 +432,10 @@ module.exports = {
   getSessionByTicketId,
   addMessage,
   getMessages,
-  getActiveSessionForCustomer
+  getActiveSessionForCustomer,
+  getSystemStats,
+  getAgentPerformance,
+  getAllActiveSessions,
+  getSettings,
+  updateSettings
 };

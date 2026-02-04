@@ -16,7 +16,7 @@ app.use(cors({
 app.use(express.json());
 
 // MongoDB Connection
-mongoose.connect('mongodb://localhost:27017/extrahand_support', {
+mongoose.connect('mongodb+srv://extrahand614_db_user:aEgPtYiKNpHuSjDU@cluster0.wjubwjn.mongodb.net/?appName=Cluster0', {
   useNewUrlParser: true,
   useUnifiedTopology: true
 }).then(() => {
@@ -56,7 +56,7 @@ const connections = {
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathParts = url.pathname.split('/').filter(Boolean);
-  
+
   console.log('[WebSocket] New connection:', url.pathname);
 
   if (pathParts[0] === 'ws') {
@@ -86,7 +86,7 @@ wss.on('connection', (ws, req) => {
     } else if (pathParts[1] === 'customer') {
       // Customer connection
       const sessionId = pathParts[2];
-      
+
       // Prevent duplicate connections
       if (connections.customers.has(sessionId)) {
         console.log(`[Customer] Duplicate connection attempt for session ${sessionId} - closing old connection`);
@@ -95,7 +95,7 @@ wss.on('connection', (ws, req) => {
           oldWs.close();
         }
       }
-      
+
       connections.customers.set(sessionId, ws);
       console.log(`[Customer] Connected: Session ${sessionId}`);
 
@@ -300,7 +300,7 @@ async function sendChatHistory(sessionId, ws) {
   try {
     const messages = await Message.find({ session_id: sessionId }).sort({ timestamp: 1 });
     const session = await Session.findById(sessionId);
-    
+
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'history',
@@ -311,7 +311,7 @@ async function sendChatHistory(sessionId, ws) {
           timestamp: msg.timestamp.toISOString()
         }))
       }));
-      
+
       // If session is already active, notify that agent has joined
       if (session && session.status === 'active' && session.agent_email) {
         ws.send(JSON.stringify({
@@ -361,25 +361,25 @@ async function sendDashboardUpdate(agentEmail) {
 app.post('/api/sessions', async (req, res) => {
   try {
     const { customer_name, customer_email } = req.body;
-    
+
     // Check for existing OPEN session (pending or active)
     const existingSession = await Session.findOne({
       customer_email,
       status: { $in: ['pending', 'active'] }
     });
-    
+
     if (existingSession) {
       console.log(`[Session] Returning existing session ${existingSession._id} for ${customer_email}`);
       return res.json({ session_id: existingSession._id.toString() });
     }
-    
+
     // Create new session
     const newSession = new Session({
       customer_name,
       customer_email,
       status: 'pending'
     });
-    
+
     await newSession.save();
 
     // Notify all connected agents about new pending chat
@@ -437,14 +437,14 @@ server.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
-  
+
   // Close all WebSocket connections
   connections.agents.forEach(ws => ws.close());
   connections.customers.forEach(ws => ws.close());
-  
+
   // Close MongoDB connection
   await mongoose.connection.close();
-  
+
   server.close(() => {
     console.log('✅ Server closed');
     process.exit(0);
