@@ -6,8 +6,14 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://extrahand614_db_us
 async function initializeDatabase() {
     try {
         if (mongoose.connection.readyState === 0) {
-            await mongoose.connect(MONGODB_URI);
+            console.log('Connecting to MongoDB with URI:', MONGODB_URI.split('@')[1] || 'default');
+            await mongoose.connect(MONGODB_URI, {
+                bufferCommands: false,
+                serverSelectionTimeoutMS: 5000
+            });
             console.log('✅ MongoDB Connected for Support Agent Backend');
+        } else {
+            console.log('MongoDB connection already in state:', mongoose.connection.readyState);
         }
     } catch (error) {
         console.error('❌ MongoDB Connection Error:', error);
@@ -27,11 +33,14 @@ const sessionSchema = new mongoose.Schema({
     issue_category_label: String,
     issue_type_label: String,
     rating: Number,
+    feedback: String,
     resolution_note: String,
+    resolution_status: { type: String, enum: ['resolved', 'unresolved'], default: 'unresolved' },
     created_at: { type: Date, default: Date.now },
     joined_at: Date,
     closed_at: { type: Date, default: null }
-});
+}, { bufferCommands: false });
+
 
 const messageSchema = new mongoose.Schema({
     session_id: { type: mongoose.Schema.Types.ObjectId, ref: 'ChatSession', required: true, index: true },
@@ -39,12 +48,12 @@ const messageSchema = new mongoose.Schema({
     sender: { type: String, required: true }, // 'customer', 'agent', 'system'
     sender_type: String, // mapping to pg legacy
     timestamp: { type: Date, default: Date.now }
-});
+}, { bufferCommands: false });
 
 const settingsSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     value: mongoose.Schema.Types.Mixed
-});
+}, { bufferCommands: false });
 
 const ChatSession = mongoose.model('ChatSession', sessionSchema);
 const ChatMessage = mongoose.model('ChatMessage', messageSchema);
@@ -54,20 +63,56 @@ const userSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true }, // In a real app, hash this!
-    role: { type: String, enum: ['user', 'admin', 'supervisor'], default: 'user' },
+    role: { type: String, enum: ['user', 'agent', 'admin', 'supervisor'], default: 'user' },
     status: { type: String, enum: ['active', 'inactive', 'suspended', 'pending'], default: 'active' },
+    team: String,
+    department: String,
+    invitation_token: String,
+    invitation_expires: Date,
     lastLoginAt: Date,
     createdAt: { type: Date, default: Date.now }
-});
+}, { bufferCommands: false });
 
+const portalLogSchema = new mongoose.Schema({
+    action: { type: String, required: true },
+    details: String,
+    user_email: String,
+    timestamp: { type: Date, default: Date.now }
+}, { bufferCommands: false });
+
+const PortalLog = mongoose.model('PortalLog', portalLogSchema);
 const User = mongoose.model('User', userSchema);
+
+// Inquiry Schema for form submissions
+const inquirySchema = new mongoose.Schema({
+    full_name: { type: String, required: true },
+    email: { type: String, required: true, index: true },
+    subject: { type: String, required: true },
+    message: { type: String, required: true },
+    status: { type: String, enum: ['pending', 'in_progress', 'resolved', 'closed'], default: 'pending', index: true },
+    assigned_agent: { type: String, default: null },
+    agent_notes: { type: String, default: null },
+    resolution_note: { type: String, default: null },
+    priority: { type: String, enum: ['low', 'medium', 'high', 'urgent'], default: 'medium' },
+    created_at: { type: Date, default: Date.now, index: true },
+    updated_at: { type: Date, default: Date.now },
+    resolved_at: { type: Date, default: null }
+}, { bufferCommands: false });
+
+const Inquiry = mongoose.model('Inquiry', inquirySchema);
 
 // API Implementations
 async function createSession(customerName, customerEmail, issueData = {}) {
+    // Generate the session ID locally so we can use it for the ticket ID before saving
+    const sessionId = new mongoose.Types.ObjectId();
+    const ticketId = `TICKET-${sessionId.toString().substring(0, 8).toUpperCase()}`;
+
     const session = new ChatSession({
+        _id: sessionId,
         customer_name: customerName,
         customer_email: customerEmail,
         status: 'pending',
+        ticket_id: ticketId,
         issue_category: issueData.category || null,
         issue_type: issueData.type || null,
         issue_category_label: issueData.categoryLabel || null,
@@ -76,14 +121,9 @@ async function createSession(customerName, customerEmail, issueData = {}) {
     });
 
     await session.save();
-
-    // Generate ticket ID
-    const ticketId = `TICKET-${session._id.toString().substring(0, 8).toUpperCase()}`;
-    session.ticket_id = ticketId;
-    await session.save();
-
     return { ...session.toObject(), id: session._id.toString() };
 }
+
 
 async function getSession(sessionId) {
     if (!mongoose.Types.ObjectId.isValid(sessionId)) return null;
@@ -102,11 +142,16 @@ async function updateSessionStatus(sessionId, status, agentEmail = null) {
     return session ? { ...session.toObject(), id: session._id.toString() } : null;
 }
 
-async function closeSession(sessionId, resolutionNote = null) {
+async function closeSession(sessionId, resolutionNote = null, resolutionStatus = 'resolved') {
     if (!mongoose.Types.ObjectId.isValid(sessionId)) return null;
     const session = await ChatSession.findByIdAndUpdate(
         sessionId,
-        { status: 'closed', closed_at: new Date(), resolution_note: resolutionNote },
+        {
+            status: 'closed',
+            closed_at: new Date(),
+            resolution_note: resolutionNote,
+            resolution_status: resolutionStatus
+        },
         { new: true }
     );
     return session ? { ...session.toObject(), id: session._id.toString() } : null;
@@ -167,6 +212,7 @@ async function getActiveSessionForCustomer(customerEmail) {
 }
 
 async function getSystemStats() {
+    // Chat Stats
     const totalTickets = await ChatSession.countDocuments();
     const activeAgents = (await ChatSession.distinct('agent_email', { status: 'active' })).length;
 
@@ -179,43 +225,161 @@ async function getSystemStats() {
     const minutes = Math.floor(avgResolutionSeconds / 60);
     const avgResolutionTime = `${minutes}m ${Math.round(avgResolutionSeconds % 60)}s`;
 
+    // Inquiry Stats
+    const totalInquiries = await Inquiry.countDocuments();
+    const inquiriesResolved = await Inquiry.countDocuments({ status: { $in: ['resolved', 'closed'] } });
+    const inquiriesUnresolved = totalInquiries - inquiriesResolved;
+
+    const inquiryStatusBreakdown = {
+        pending: await Inquiry.countDocuments({ status: 'pending' }),
+        in_progress: await Inquiry.countDocuments({ status: 'in_progress' }),
+        resolved: await Inquiry.countDocuments({ status: 'resolved' }),
+        closed: await Inquiry.countDocuments({ status: 'closed' })
+    };
+
     const statusBreakdown = {
-        pending: await ChatSession.countDocuments({ status: 'pending' }),
-        active: await ChatSession.countDocuments({ status: 'active' }),
-        closed: await ChatSession.countDocuments({ status: 'closed' })
+        pending: (await ChatSession.countDocuments({ status: 'pending' })) + inquiryStatusBreakdown.pending,
+        active: (await ChatSession.countDocuments({ status: 'active' })) + inquiryStatusBreakdown.in_progress,
+        closed: (await ChatSession.countDocuments({ status: 'closed' })) + inquiryStatusBreakdown.closed,
+        resolved: (await ChatSession.countDocuments({ status: 'closed', resolution_status: 'resolved' })) + inquiryStatusBreakdown.resolved,
+        unresolved: (await ChatSession.countDocuments({ status: 'closed', resolution_status: 'unresolved' })) + inquiriesUnresolved // Approximation for inquiries
     };
 
     const recentActivity = await ChatSession.find().sort({ created_at: -1 }).limit(5);
+    const recentInquiries = await Inquiry.find().sort({ created_at: -1 }).limit(5);
+
+    // Merge and sort combined recent activity
+    const combinedActivity = [
+        ...recentActivity.map(s => ({ ...s.toObject(), type: 'chat', id: s._id.toString() })),
+        ...recentInquiries.map(i => ({ ...i.toObject(), type: 'inquiry', id: i._id.toString() }))
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 5);
 
     return {
-        total_tickets: totalTickets,
+        total_tickets: totalTickets + totalInquiries,
         active_agents: activeAgents,
-        avg_resolution_time: avgResolutionTime,
+        avg_resolution_time: avgResolutionTime, // Keep this strictly for chats for now as inquiries can span days
         status_breakdown: statusBreakdown,
-        recent_activity: recentActivity.map(s => ({ ...s.toObject(), id: s._id.toString() }))
+        recent_activity: combinedActivity
     };
 }
 
 async function getAgentPerformance() {
-    const performance = await ChatSession.aggregate([
+    // 1. Get stats for agents who have participated in closed sessions
+    const chatPerformance = await ChatSession.aggregate([
         { $match: { status: 'closed', agent_email: { $ne: null } } },
         {
             $group: {
                 _id: '$agent_email',
                 total_chats: { $sum: 1 },
+                resolved_chats: {
+                    $sum: { $cond: [{ $eq: ['$resolution_status', 'resolved'] }, 1, 0] }
+                },
                 avg_rating: { $avg: '$rating' },
                 avg_duration: { $avg: { $subtract: ['$closed_at', '$joined_at'] } }
             }
-        },
-        { $sort: { total_chats: -1 } }
+        }
     ]);
 
-    return performance.map(p => ({
-        agent_email: p._id,
-        total_chats: p.total_chats,
-        avg_rating: p.avg_rating ? p.avg_rating.toFixed(1) : 'N/A',
-        avg_duration: p.avg_duration ? `${Math.floor(p.avg_duration / 60000)}m` : 'N/A'
-    }));
+    // 2. Get stats for inquiries
+    const inquiryPerformance = await Inquiry.aggregate([
+        { $match: { assigned_agent: { $ne: null } } },
+        {
+            $group: {
+                _id: '$assigned_agent',
+                total_inquiries: { $sum: 1 },
+                resolved_inquiries: {
+                    $sum: { $cond: [{ $in: ['$status', ['resolved', 'closed']] }, 1, 0] }
+                },
+                // Estimate duration if needed, or skip
+            }
+        }
+    ]);
+
+    // Create a map of email -> stats
+    const statsMap = {};
+
+    // Process Chat Stats
+    chatPerformance.forEach(p => {
+        statsMap[p._id] = {
+            total_chats: p.total_chats,
+            resolved_chats: p.resolved_chats,
+            avg_rating: p.avg_rating,
+            avg_duration: p.avg_duration,
+            total_inquiries: 0,
+            resolved_inquiries: 0
+        };
+    });
+
+    // Process Inquiry Stats
+    inquiryPerformance.forEach(p => {
+        if (!statsMap[p._id]) {
+            statsMap[p._id] = {
+                total_chats: 0,
+                resolved_chats: 0,
+                avg_rating: null,
+                avg_duration: null,
+                total_inquiries: 0,
+                resolved_inquiries: 0
+            };
+        }
+        statsMap[p._id].total_inquiries = p.total_inquiries;
+        statsMap[p._id].resolved_inquiries = p.resolved_inquiries;
+    });
+
+    // 2. Get all users who should be in the list
+    const emailsWithStats = Object.keys(statsMap);
+
+    const users = await User.find({
+        $or: [
+            { role: { $in: ['agent', 'admin', 'supervisor'] } },
+            { email: { $in: emailsWithStats } }
+        ]
+    });
+
+    const userMap = {};
+    users.forEach(u => userMap[u.email] = u);
+
+    // 3. Combine unique emails from both sources
+    const allEmails = new Set([...emailsWithStats, ...users.map(u => u.email)]);
+
+    const combinedResults = Array.from(allEmails).map(email => {
+        const user = userMap[email];
+        const stats = statsMap[email] || {
+            total_chats: 0,
+            resolved_chats: 0,
+            avg_rating: null,
+            avg_duration: null,
+            total_inquiries: 0,
+            resolved_inquiries: 0
+        };
+
+        const totalVolume = stats.total_chats + stats.total_inquiries;
+        const totalResolved = stats.resolved_chats + stats.resolved_inquiries;
+
+        return {
+            agent_email: email,
+            agent_name: user ? user.name : (email.split('@')[0] + ' (Deleted)'),
+            role: user ? user.role : 'unknown',
+            total_chats: stats.total_chats,
+            resolved_chats: stats.resolved_chats,
+
+            // New merged fields
+            total_inquiries: stats.total_inquiries,
+            resolved_inquiries: stats.resolved_inquiries,
+            total_volume: totalVolume,
+
+            resolution_rate: totalVolume > 0 ? Math.round((totalResolved / totalVolume) * 100) : 0,
+            avg_rating: stats.avg_rating !== null ? stats.avg_rating.toFixed(1) : 'N/A',
+            avg_duration: stats.avg_duration !== null ? `${Math.floor(stats.avg_duration / 60000)}m` : 'N/A',
+            last_active: (user && (user.lastLoginAt || user.createdAt)) ? (user.lastLoginAt || user.createdAt) : null
+        };
+    });
+
+    // Sort by total volume (desc), then by name (asc)
+    return combinedResults.sort((a, b) => {
+        if (b.total_volume !== a.total_volume) return b.total_volume - a.total_volume;
+        return (a.agent_name || a.agent_email).localeCompare(b.agent_name || b.agent_email);
+    });
 }
 
 async function getAllActiveSessions() {
@@ -251,14 +415,15 @@ async function getSettings() {
             timezone: 'Asia/Kolkata (IST)',
             enableEmailNotifications: true,
             enableSoundAlerts: true,
-            autoAssignChats: true,
+            autoAssignChats: false,
             maintenanceMode: false
         };
     }
+
     return result;
 }
 
-async function updateSettings(newSettings) {
+async function updateSettings(newSettings, userEmail = 'admin') {
     for (const [key, value] of Object.entries(newSettings)) {
         await SystemSetting.findOneAndUpdate(
             { key },
@@ -266,7 +431,27 @@ async function updateSettings(newSettings) {
             { upsidert: true, new: true, upsert: true }
         );
     }
+
+    // Log the change
+    const log = new PortalLog({
+        action: 'SETTINGS_UPDATE',
+        details: `Updated system settings: ${Object.keys(newSettings).join(', ')}`,
+        user_email: userEmail
+    });
+    await log.save();
+
     return await getSettings();
+}
+
+async function getPortalLogs(limit = 20) {
+    const logs = await PortalLog.find().sort({ timestamp: -1 }).limit(limit);
+    return logs.map(l => ({ ...l.toObject(), id: l._id.toString() }));
+}
+
+async function addPortalLog(action, details, userEmail) {
+    const log = new PortalLog({ action, details, user_email: userEmail });
+    await log.save();
+    return log.toObject();
 }
 
 // User Management Functions
@@ -312,7 +497,94 @@ async function updateUserRole(userId, newRole) {
     return user ? { ...user.toObject(), id: user._id.toString(), _id: user._id.toString() } : null;
 }
 
+async function updateLastLogin(email) {
+    return await User.findOneAndUpdate({ email }, { lastLoginAt: new Date() }, { new: true });
+}
+
+// Inquiry Management Functions
+async function createInquiry(inquiryData) {
+    const inquiry = new Inquiry({
+        full_name: inquiryData.full_name,
+        email: inquiryData.email,
+        subject: inquiryData.subject,
+        message: inquiryData.message,
+        priority: inquiryData.priority || 'medium',
+        status: 'pending',
+        created_at: new Date(),
+        updated_at: new Date()
+    });
+    await inquiry.save();
+    return { ...inquiry.toObject(), id: inquiry._id.toString() };
+}
+
+async function getAllInquiries(filters = {}) {
+    const query = {};
+    if (filters.status) query.status = filters.status;
+    if (filters.assigned_agent) query.assigned_agent = filters.assigned_agent;
+    if (filters.priority) query.priority = filters.priority;
+
+    const inquiries = await Inquiry.find(query).sort({ created_at: -1 });
+    return inquiries.map(i => ({ ...i.toObject(), id: i._id.toString() }));
+}
+
+async function getInquiryById(inquiryId) {
+    if (!mongoose.Types.ObjectId.isValid(inquiryId)) return null;
+    const inquiry = await Inquiry.findById(inquiryId);
+    return inquiry ? { ...inquiry.toObject(), id: inquiry._id.toString() } : null;
+}
+
+async function updateInquiryStatus(inquiryId, status, resolutionNote = null) {
+    if (!mongoose.Types.ObjectId.isValid(inquiryId)) return null;
+    const update = {
+        status,
+        updated_at: new Date()
+    };
+    if (resolutionNote) update.resolution_note = resolutionNote;
+    if (status === 'resolved' || status === 'closed') update.resolved_at = new Date();
+
+    const inquiry = await Inquiry.findByIdAndUpdate(inquiryId, update, { new: true });
+    return inquiry ? { ...inquiry.toObject(), id: inquiry._id.toString() } : null;
+}
+
+async function assignInquiryToAgent(inquiryId, agentEmail) {
+    if (!mongoose.Types.ObjectId.isValid(inquiryId)) return null;
+    const inquiry = await Inquiry.findByIdAndUpdate(
+        inquiryId,
+        {
+            assigned_agent: agentEmail,
+            status: 'in_progress',
+            updated_at: new Date()
+        },
+        { new: true }
+    );
+    return inquiry ? { ...inquiry.toObject(), id: inquiry._id.toString() } : null;
+}
+
+async function addInquiryNotes(inquiryId, notes) {
+    if (!mongoose.Types.ObjectId.isValid(inquiryId)) return null;
+    const inquiry = await Inquiry.findByIdAndUpdate(
+        inquiryId,
+        {
+            agent_notes: notes,
+            updated_at: new Date()
+        },
+        { new: true }
+    );
+    return inquiry ? { ...inquiry.toObject(), id: inquiry._id.toString() } : null;
+}
+
+async function getInquiriesByEmail(email) {
+    const inquiries = await Inquiry.find({ email }).sort({ created_at: -1 });
+    return inquiries.map(i => ({ ...i.toObject(), id: i._id.toString() }));
+}
+
+async function getInquiriesAssignedToAgent(agentEmail) {
+    const inquiries = await Inquiry.find({ assigned_agent: agentEmail }).sort({ created_at: -1 });
+    return inquiries.map(i => ({ ...i.toObject(), id: i._id.toString() }));
+}
+
 module.exports = {
+    updateLastLogin,
     initializeDatabase,
     createSession,
     getSession,
@@ -336,5 +608,37 @@ module.exports = {
     activateUser,
     deleteUser,
     updateUserPassword,
-    updateUserRole
+    updateUserRole,
+    getPortalLogs,
+    addPortalLog,
+    // Inquiry Management
+    createInquiry,
+    getAllInquiries,
+    getInquiryById,
+    updateInquiryStatus,
+    assignInquiryToAgent,
+    addInquiryNotes,
+    getInquiriesByEmail,
+    getInquiriesAssignedToAgent,
+    getUserByEmail: async (email) => {
+        const user = await User.findOne({ email });
+        return user ? { ...user.toObject(), id: user._id.toString() } : null;
+    },
+    acceptInvitation: async (token, password) => {
+        const user = await User.findOne({
+            invitation_token: token,
+            invitation_expires: { $gt: new Date() }
+        });
+
+        if (!user) return null;
+
+        user.password = password; // In production, hash this!
+        user.status = 'active';
+        user.invitation_token = undefined;
+        user.invitation_expires = undefined;
+        user.joined_at = new Date();
+
+        await user.save();
+        return { ...user.toObject(), id: user._id.toString() };
+    }
 };
