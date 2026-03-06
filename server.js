@@ -19,11 +19,12 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Middleware - allow frontend origins (local + production from env)
+// Middleware - allow frontend origins (local + production)
 const corsOrigins = [
   'http://localhost:3004',
   'http://localhost:3005',
   'http://localhost:3000',
+  'https://extrahand-ticket-service-frontend.apps.extrahand.in',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : []),
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
 ];
