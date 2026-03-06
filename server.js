@@ -25,6 +25,7 @@ const corsOrigins = [
   'http://localhost:3005',
   'http://localhost:3000',
   'https://extrahand-ticket-service-frontend.apps.extrahand.in',
+  'https://support.extrahand.in',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : []),
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
 ];
