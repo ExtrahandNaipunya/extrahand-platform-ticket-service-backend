@@ -1,4 +1,4 @@
-# Support Agent Backend Server Dockerfile
+# Support Agent Backend Server Dockerfile (CapRover-ready)
 FROM node:18-alpine
 
 WORKDIR /app
@@ -7,13 +7,12 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm install --production
+RUN npm ci --omit=dev
 
 # Copy application files
 COPY . .
 
-# Expose WebSocket port
-EXPOSE 9000
+# CapRover sets PORT at runtime; app uses process.env.PORT || 8001
+EXPOSE 8001
 
-# Start server
-CMD ["npm", "start"]
+CMD ["node", "server.js"]

@@ -19,9 +19,16 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Middleware
+// Middleware - allow frontend origins (local + production from env)
+const corsOrigins = [
+  'http://localhost:3004',
+  'http://localhost:3005',
+  'http://localhost:3000',
+  ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : []),
+  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
+];
 app.use(cors({
-  origin: ['http://localhost:3004', 'http://localhost:3005', 'http://localhost:3000'],
+  origin: corsOrigins.length ? corsOrigins : true,
   credentials: true
 }));
 app.use(express.json());
