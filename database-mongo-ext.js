@@ -1,24 +1,42 @@
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 
-// MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://extrahand614_db_user:aEgPtYiKNpHuSjDU@cluster0.wjubwjn.mongodb.net/?appName=Cluster0';
+// MongoDB — set MONGODB_URI in env (never commit cluster credentials as code defaults)
+const MONGODB_URI =
+  process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/extrahand-support';
+
+function maskMongoUri(uri) {
+  try {
+    return uri.replace(/\/\/([^:@/]+):([^@]+)@/, '//$1:***@');
+  } catch {
+    return '(invalid uri)';
+  }
+}
 
 async function initializeDatabase() {
-    try {
-        if (mongoose.connection.readyState === 0) {
-            console.log('Connecting to MongoDB with URI:', MONGODB_URI.split('@')[1] || 'default');
-            await mongoose.connect(MONGODB_URI, {
-                bufferCommands: false,
-                serverSelectionTimeoutMS: 5000
-            });
-            console.log('✅ MongoDB Connected for Support Agent Backend');
-        } else {
-            console.log('MongoDB connection already in state:', mongoose.connection.readyState);
-        }
-    } catch (error) {
-        console.error('❌ MongoDB Connection Error:', error);
-        throw error;
+  try {
+    // 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
+    if (mongoose.connection.readyState === 1) {
+      console.log('✅ MongoDB already connected');
+      return;
     }
+    if (mongoose.connection.readyState === 2) {
+      await mongoose.connection.asPromise();
+      console.log('✅ MongoDB connected (awaited in-flight connection)');
+      return;
+    }
+
+    console.log('Connecting to MongoDB:', maskMongoUri(MONGODB_URI));
+    await mongoose.connect(MONGODB_URI, {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 15000,
+      maxPoolSize: 10
+    });
+    console.log('✅ MongoDB Connected for Support Agent Backend');
+  } catch (error) {
+    console.error('❌ MongoDB Connection Error:', error);
+    throw error;
+  }
 }
 
 // Schemas
@@ -486,8 +504,8 @@ async function deleteUser(userId) {
 
 async function updateUserPassword(userId, newPassword) {
     if (!mongoose.Types.ObjectId.isValid(userId)) return null;
-    // In production, hash this password!
-    const user = await User.findByIdAndUpdate(userId, { password: newPassword }, { new: true });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    const user = await User.findByIdAndUpdate(userId, { password: hashed }, { new: true });
     return user ? true : false;
 }
 
@@ -583,6 +601,36 @@ async function getInquiriesAssignedToAgent(agentEmail) {
     return inquiries.map(i => ({ ...i.toObject(), id: i._id.toString() }));
 }
 
+/** Create default admin from ADMIN_EMAIL / ADMIN_PASSWORD (etc.) if missing */
+async function seedAdminUserFromEnv() {
+    const adminEmail = (process.env.ADMIN_EMAIL || 'admin@extrahand.in').trim().toLowerCase();
+    const adminPassword = (process.env.ADMIN_PASSWORD || 'Admin@123').trim();
+    const adminName = (process.env.ADMIN_NAME || 'ExtraHand Admin').trim();
+    let adminRole = (process.env.ADMIN_ROLE || 'admin').trim().toLowerCase();
+    if (!['user', 'agent', 'admin', 'supervisor'].includes(adminRole)) {
+        adminRole = 'admin';
+    }
+
+    const existing = await User.findOne({ email: adminEmail });
+    if (existing) {
+        return { created: false, email: adminEmail };
+    }
+
+    const passwordHash = await bcrypt.hash(adminPassword, 10);
+    const user = new User({
+        name: adminName,
+        email: adminEmail,
+        password: passwordHash,
+        role: adminRole,
+        status: 'active'
+    });
+    await user.save();
+    if (!process.env.ADMIN_PASSWORD) {
+        console.log('⚠️ ADMIN_PASSWORD not set; using default password. Set ADMIN_PASSWORD in production.');
+    }
+    return { created: true, email: adminEmail };
+}
+
 module.exports = {
     updateLastLogin,
     initializeDatabase,
@@ -620,8 +668,15 @@ module.exports = {
     addInquiryNotes,
     getInquiriesByEmail,
     getInquiriesAssignedToAgent,
+    seedAdminUserFromEnv,
     getUserByEmail: async (email) => {
-        const user = await User.findOne({ email });
+        if (!email || typeof email !== 'string') return null;
+        const trimmed = email.trim();
+        const lower = trimmed.toLowerCase();
+        let user = await User.findOne({ email: lower });
+        if (!user && lower !== trimmed) {
+            user = await User.findOne({ email: trimmed });
+        }
         return user ? { ...user.toObject(), id: user._id.toString() } : null;
     },
     acceptInvitation: async (token, password) => {
@@ -632,7 +687,7 @@ module.exports = {
 
         if (!user) return null;
 
-        user.password = password; // In production, hash this!
+        user.password = await bcrypt.hash(password, 10);
         user.status = 'active';
         user.invitation_token = undefined;
         user.invitation_expires = undefined;

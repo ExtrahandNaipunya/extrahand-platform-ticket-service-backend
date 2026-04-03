@@ -10,6 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const { QueueManager } = require('./redis');
 const { getTypeLabel } = require('./issue-categories');
+const bcrypt = require('bcryptjs');
+const mongoose = require('mongoose');
 const db = require('./database-mongo-ext');
 
 // Debug: Check database configuration
@@ -19,29 +21,39 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Middleware - allow frontend origins (local + production)
-const corsOrigins = [
+// Middleware — merge local defaults, CapRover env (CORS_ORIGINS / CORS_ORIGIN), WEB_APP_URL, FRONTEND_URL
+const defaultCorsOrigins = [
   'http://localhost:3004',
   'http://localhost:3005',
   'http://localhost:3000',
   'https://extrahand-ticket-service-frontend.apps.extrahand.in',
   'https://support.extrahand.in',
-  ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : []),
-  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
+  'https://www.support.extrahand.in'
 ];
-app.use(cors({
-  origin: corsOrigins.length ? corsOrigins : true,
-  credentials: true
-}));
+const parseOriginList = (value) =>
+  (value || '')
+    .split(',')
+    .map((s) => s.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+const envCorsLists = [
+  ...parseOriginList(process.env.CORS_ORIGINS),
+  ...parseOriginList(process.env.CORS_ORIGIN)
+];
+const singleUrls = [
+  process.env.WEB_APP_URL,
+  process.env.FRONTEND_URL
+]
+  .filter(Boolean)
+  .map((u) => u.trim().replace(/\/$/, ''));
+const corsOrigins = [...new Set([...defaultCorsOrigins, ...singleUrls, ...envCorsLists])];
+app.use(
+  cors({
+    origin: corsOrigins,
+    credentials: true
+  })
+);
+console.log('🌐 CORS allowed origins:', corsOrigins.join(', '));
 app.use(express.json());
-
-// Initialize MongoDB database
-db.initializeDatabase().then(() => {
-  console.log('✅ MongoDB Database connected and initialized');
-}).catch(err => {
-  console.error('❌ Failed to initialize MongoDB:', err.message);
-  console.log('⚠️  Server will continue but database operations will fail');
-});
 
 // In-memory connection tracking
 const connections = {
@@ -705,7 +717,6 @@ app.post('/api/sessions/:id/feedback', async (req, res) => {
     }
 
     // Update session with feedback using Mongoose
-    const mongoose = require('mongoose');
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid session ID' });
     }
@@ -1000,19 +1011,12 @@ app.post('/api/auth/login', async (req, res) => {
     // Let's assume simple comparison or hash check.
     // Wait, 'acceptInvitation' usually updates the password.
 
-    // IMPORTANT: We need to know if db stores hash or plain.
-    // Given earlier snippets, likely minimal implementation.
-    // We will try direct compare first, if fail, try bcrypt verify if we can impoort it.
-    // Use db.validatePassword if available? No.
-
-    // Let's implement a safe check logic
     let valid = false;
-    if (user.password === password) valid = true; // Plaintext match
-
-    // Logic for hashed password if user.password looks hashed (starts with $2a$)
-    // We can't easily do it without importing bcrypt here.
-    // But for this "fix", assuming the user just set the password via accept-invite.
-    // If accept-invite hashed it, we need to hash check.
+    if (user.password && typeof user.password === 'string' && user.password.startsWith('$2')) {
+      valid = await bcrypt.compare(password, user.password);
+    } else {
+      valid = user.password === password;
+    }
 
     if (!valid) {
       console.log('[Auth] Password mismatch for:', email);
@@ -2073,28 +2077,50 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server
+// Start server only after MongoDB is ready (avoids racing API requests before connect)
 const PORT = process.env.PORT || 8001;
-server.listen(PORT, () => {
-  console.log(`
+
+async function startServer() {
+  try {
+    await db.initializeDatabase();
+    const seedResult = await db.seedAdminUserFromEnv();
+    if (seedResult) {
+      console.log(
+        `✅ Admin seed: ${seedResult.email}${seedResult.created ? ' (created)' : ' (already present)'}`
+      );
+    }
+    console.log('✅ MongoDB ready');
+  } catch (err) {
+    console.error('❌ Failed to initialize MongoDB / seed admin:', err.message);
+    process.exit(1);
+  }
+
+  server.listen(PORT, () => {
+    console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║  🚀 Support Agent Backend Server Running                 ║
 ║  📡 Port: ${PORT}                                           ║
 ║  🔌 WebSocket: ws://localhost:${PORT}/ws/agent/{email}      ║
 ║  🔌 WebSocket: ws://localhost:${PORT}/ws/customer/{id}      ║
-║  ✅ Database: PostgreSQL (Neon)                           ║
+║  ✅ Database: MongoDB                                      ║
 ╚═══════════════════════════════════════════════════════════╝
   `);
-});
+  });
+}
+
+startServer();
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down gracefully...');
-  wss.clients.forEach(client => client.close());
-  // No need for pool.end with mongo-ext yet, or add disconnected logic
-  // mongoose.disconnect();
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
+  wss.clients.forEach((client) => client.close());
+  mongoose.connection
+    .close()
+    .catch(() => {})
+    .finally(() => {
+      server.close(() => {
+        console.log('✅ Server closed');
+        process.exit(0);
+      });
+    });
 });
