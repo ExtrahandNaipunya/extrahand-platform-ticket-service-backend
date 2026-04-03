@@ -479,7 +479,15 @@ async function getAllUsers() {
 }
 
 async function createUser(userData) {
-    const user = new User(userData);
+    const payload = { ...userData };
+    if (
+        payload.password &&
+        typeof payload.password === 'string' &&
+        !payload.password.startsWith('$2')
+    ) {
+        payload.password = await bcrypt.hash(payload.password, 10);
+    }
+    const user = new User(payload);
     await user.save();
     return { ...user.toObject(), id: user._id.toString(), _id: user._id.toString() };
 }

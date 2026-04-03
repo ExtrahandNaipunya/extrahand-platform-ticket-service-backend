@@ -886,7 +886,7 @@ app.put('/api/admin/users/:id/activate', async (req, res) => {
 // Invite new admin/user
 app.post('/api/admin/invite', async (req, res) => {
   try {
-    const { email, role, team, department } = req.body;
+    const { email, role, team, department, name, platformName } = req.body;
 
     if (!email || !role) {
       return res.status(400).json({ error: 'Email and Role are required' });
@@ -905,8 +905,14 @@ app.post('/api/admin/invite', async (req, res) => {
     expiresAt.setHours(expiresAt.getHours() + 48); // 48 hours expiry
 
     // Create pending user
+    const displayName = (name && String(name).trim()) || email.split('@')[0];
+    const invitePlatformName =
+      (platformName && String(platformName).trim()) ||
+      process.env.TICKET_INVITE_PLATFORM_NAME ||
+      'Ticket Management Portal';
+
     const newUser = await db.createUser({
-      name: email.split('@')[0], // Default name from email
+      name: displayName,
       email,
       password: tempPassword, // Should be hashed in production
       role,
@@ -917,8 +923,9 @@ app.post('/api/admin/invite', async (req, res) => {
       invitation_expires: expiresAt
     });
 
-    // Send Invite Email via Email Service
-    const emailServiceUrl = 'http://localhost:4007/api/v1/email/admin-invite';
+    // Send Invite Email via Email Service (extrahand-email-service)
+    const emailBase = (process.env.EMAIL_SERVICE_URL || 'http://localhost:4007').replace(/\/$/, '');
+    const emailServiceUrl = `${emailBase}/api/v1/email/admin-invite`;
     const webAppUrl = process.env.WEB_APP_URL || 'http://localhost:3000';
     const inviteLink = `${webAppUrl}/accept-invite?token=${inviteToken}`;
     const serviceAuthToken = process.env.SERVICE_AUTH_TOKEN || 'ExtraHand_Secure_Token_2024_MinLength32Chars_ChangeInProduction';
@@ -930,14 +937,22 @@ app.post('/api/admin/invite', async (req, res) => {
     console.log('---------------------------------------------------');
 
     console.log('[Backend] Sending invite request to:', emailServiceUrl);
-    console.log('[Backend] Payload:', { email, role, inviteLink, expiresAt });
+    console.log('[Backend] Payload:', {
+      email,
+      role,
+      inviteLink,
+      expiresAt,
+      platformName: invitePlatformName,
+      name: displayName
+    });
 
     try {
       const emailResponse = await fetch(emailServiceUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-service-auth': serviceAuthToken
+          'x-service-auth': serviceAuthToken,
+          'x-service-name': 'extrahand-platform-ticket-service-backend'
         },
         body: JSON.stringify({
           email,
@@ -945,7 +960,9 @@ app.post('/api/admin/invite', async (req, res) => {
           team,
           department,
           inviteLink,
-          expiresAt
+          expiresAt,
+          platformName: invitePlatformName,
+          name: displayName
         })
       });
 
