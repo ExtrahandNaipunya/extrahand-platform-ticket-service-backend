@@ -108,7 +108,8 @@ const inquirySchema = new mongoose.Schema({
     subject: { type: String, required: true },
     message: { type: String, required: true },
     status: { type: String, enum: ['pending', 'in_progress', 'resolved', 'closed'], default: 'pending', index: true },
-    assigned_agent: { type: String, default: null },
+    assigned_agent: { type: String, default: null }, // legacy: assigned agent email
+    assigned_agent_id: { type: String, default: null, index: true }, // phase-2 canonical identity
     agent_notes: { type: String, default: null },
     resolution_note: { type: String, default: null },
     priority: { type: String, enum: ['low', 'medium', 'high', 'urgent'], default: 'medium' },
@@ -195,6 +196,50 @@ async function getClosedSessions(agentEmail = null, customerEmail = null, limit 
     if (limit) dbQuery = dbQuery.limit(parseInt(limit));
     const sessions = await dbQuery;
     return sessions.map(s => ({ ...s.toObject(), id: s._id.toString() }));
+}
+
+async function getSupervisorTicketsPaginated({
+    page = 1,
+    limit = 20,
+    status = 'all',
+    search = '',
+    sortBy = 'newest'
+} = {}) {
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const safeLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const query = {};
+
+    if (status && status !== 'all') {
+        query.status = status;
+    }
+
+    if (search && String(search).trim()) {
+        const escaped = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rx = new RegExp(escaped, 'i');
+        query.$or = [
+            { ticket_id: rx },
+            { customer_name: rx },
+            { customer_email: rx },
+            { issue_category_label: rx },
+            { issue_type_label: rx },
+            { agent_email: rx }
+        ];
+    }
+
+    const sort = sortBy === 'oldest' ? { created_at: 1 } : { created_at: -1 };
+    const total = await ChatSession.countDocuments(query);
+    const tickets = await ChatSession.find(query)
+        .sort(sort)
+        .skip((safePage - 1) * safeLimit)
+        .limit(safeLimit);
+
+    return {
+        tickets: tickets.map((t) => ({ ...t.toObject(), id: t._id.toString() })),
+        total,
+        page: safePage,
+        limit: safeLimit,
+        totalPages: Math.max(1, Math.ceil(total / safeLimit))
+    };
 }
 
 async function getSessionByTicketId(ticketId) {
@@ -434,6 +479,7 @@ async function getSettings() {
             enableEmailNotifications: true,
             enableSoundAlerts: true,
             autoAssignChats: false,
+            privacyMode: false,
             maintenanceMode: false
         };
     }
@@ -523,6 +569,16 @@ async function updateUserRole(userId, newRole) {
     return user ? { ...user.toObject(), id: user._id.toString(), _id: user._id.toString() } : null;
 }
 
+async function updateUserNameByEmail(email, name) {
+    if (!email || !name) return null;
+    const user = await User.findOneAndUpdate(
+        { email: String(email).trim().toLowerCase() },
+        { name: String(name).trim() },
+        { new: true }
+    );
+    return user ? { ...user.toObject(), id: user._id.toString(), _id: user._id.toString() } : null;
+}
+
 async function updateLastLogin(email) {
     return await User.findOneAndUpdate({ email }, { lastLoginAt: new Date() }, { new: true });
 }
@@ -547,6 +603,21 @@ async function getAllInquiries(filters = {}) {
     const query = {};
     if (filters.status) query.status = filters.status;
     if (filters.assigned_agent) query.assigned_agent = filters.assigned_agent;
+    if (filters.assigned_agent_id) query.assigned_agent_id = filters.assigned_agent_id;
+    if (filters.assigned_agent_identity) {
+        const parts = [];
+        if (filters.assigned_agent_identity.id) {
+            parts.push({ assigned_agent_id: filters.assigned_agent_identity.id });
+        }
+        if (filters.assigned_agent_identity.email) {
+            parts.push({ assigned_agent: filters.assigned_agent_identity.email });
+        }
+        if (parts.length === 1) {
+            Object.assign(query, parts[0]);
+        } else if (parts.length > 1) {
+            query.$or = parts;
+        }
+    }
     if (filters.priority) query.priority = filters.priority;
 
     const inquiries = await Inquiry.find(query).sort({ created_at: -1 });
@@ -572,12 +643,13 @@ async function updateInquiryStatus(inquiryId, status, resolutionNote = null) {
     return inquiry ? { ...inquiry.toObject(), id: inquiry._id.toString() } : null;
 }
 
-async function assignInquiryToAgent(inquiryId, agentEmail) {
+async function assignInquiryToAgent(inquiryId, agentEmail, agentId = null) {
     if (!mongoose.Types.ObjectId.isValid(inquiryId)) return null;
     const inquiry = await Inquiry.findByIdAndUpdate(
         inquiryId,
         {
             assigned_agent: agentEmail,
+            assigned_agent_id: agentId || null,
             status: 'in_progress',
             updated_at: new Date()
         },
@@ -607,6 +679,32 @@ async function getInquiriesByEmail(email) {
 async function getInquiriesAssignedToAgent(agentEmail) {
     const inquiries = await Inquiry.find({ assigned_agent: agentEmail }).sort({ created_at: -1 });
     return inquiries.map(i => ({ ...i.toObject(), id: i._id.toString() }));
+}
+
+async function getUserById(userId) {
+    if (!userId) return null;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return null;
+    const user = await User.findById(userId);
+    return user ? { ...user.toObject(), id: user._id.toString(), _id: user._id.toString() } : null;
+}
+
+async function backfillInquiryAssignedAgentIds() {
+    const inquiries = await Inquiry.find({
+        assigned_agent: { $ne: null },
+        $or: [{ assigned_agent_id: null }, { assigned_agent_id: { $exists: false } }]
+    });
+
+    let updated = 0;
+    for (const inquiry of inquiries) {
+        const agentEmail = String(inquiry.assigned_agent || '').trim().toLowerCase();
+        if (!agentEmail) continue;
+        const user = await User.findOne({ email: agentEmail });
+        if (!user) continue;
+        inquiry.assigned_agent_id = user._id.toString();
+        await inquiry.save();
+        updated += 1;
+    }
+    return { scanned: inquiries.length, updated };
 }
 
 /** Create default admin from ADMIN_EMAIL / ADMIN_PASSWORD (etc.) if missing */
@@ -649,6 +747,7 @@ module.exports = {
     getPendingSessions,
     getActiveSessions,
     getClosedSessions,
+    getSupervisorTicketsPaginated,
     getSessionByTicketId,
     addMessage,
     getMessages,
@@ -665,6 +764,7 @@ module.exports = {
     deleteUser,
     updateUserPassword,
     updateUserRole,
+    updateUserNameByEmail,
     getPortalLogs,
     addPortalLog,
     // Inquiry Management
@@ -676,6 +776,8 @@ module.exports = {
     addInquiryNotes,
     getInquiriesByEmail,
     getInquiriesAssignedToAgent,
+    getUserById,
+    backfillInquiryAssignedAgentIds,
     seedAdminUserFromEnv,
     getUserByEmail: async (email) => {
         if (!email || typeof email !== 'string') return null;

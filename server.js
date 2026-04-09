@@ -18,12 +18,15 @@ console.log('🔍 MONGODB_URI loaded:', process.env.MONGODB_URI ? 'FOUND (hidden
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const WS_HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 30000);
 
 // Middleware — merge local defaults, CapRover env (CORS_ORIGINS / CORS_ORIGIN), WEB_APP_URL, FRONTEND_URL
 const defaultCorsOrigins = [
   'http://localhost:3004',
   'http://localhost:3005',
   'http://localhost:3000',
+  'https://tickets.extrahand.in',
+  // Legacy CapRover hostname (same app); remove when traffic is only on tickets.extrahand.in
   'https://extrahand-ticket-service-frontend.apps.extrahand.in',
   'https://support.extrahand.in',
   'https://www.support.extrahand.in'
@@ -52,6 +55,120 @@ app.use(
 );
 console.log('🌐 CORS allowed origins:', corsOrigins.join(', '));
 app.use(express.json());
+
+async function sendAccountStatusEmailNotification(user, action) {
+  try {
+    if (!user?.email) return;
+
+    const emailBase = (process.env.EMAIL_SERVICE_URL || 'http://localhost:4007').replace(/\/$/, '');
+    const emailServiceUrl = `${emailBase}/api/v1/email/send`;
+    const serviceAuthToken =
+      process.env.SERVICE_AUTH_TOKEN || 'ExtraHand_Secure_Token_2024_MinLength32Chars_ChangeInProduction';
+    const platformName = process.env.TICKET_INVITE_PLATFORM_NAME || 'Ticket Management Portal';
+    const userDisplayName = user.name || user.email.split('@')[0];
+    const isSuspended = action === 'suspended';
+    const subject = isSuspended
+      ? `Account Access Suspended - ${platformName}`
+      : `Account Access Restored - ${platformName}`;
+    const statusLine = isSuspended
+      ? 'Your account access has been temporarily suspended by an administrator.'
+      : 'Your account access has been restored. You can now sign in again.';
+    const helpLine = isSuspended
+      ? 'If you believe this is incorrect, please contact your administrator.'
+      : 'If you still face issues signing in, please contact support.';
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
+        <h2 style="margin-bottom:12px;">${isSuspended ? 'Account Suspended' : 'Account Reactivated'}</h2>
+        <p>Hello ${userDisplayName},</p>
+        <p>${statusLine}</p>
+        <p>${helpLine}</p>
+        <p style="margin-top:20px;">Regards,<br/>${platformName} Team</p>
+      </div>
+    `;
+    const text = [
+      `${isSuspended ? 'Account Suspended' : 'Account Reactivated'}`,
+      ``,
+      `Hello ${userDisplayName},`,
+      `${statusLine}`,
+      `${helpLine}`,
+      ``,
+      `Regards,`,
+      `${platformName} Team`
+    ].join('\n');
+
+    const emailResponse = await fetch(emailServiceUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-service-auth': serviceAuthToken,
+        'x-service-name': 'extrahand-platform-ticket-service-backend'
+      },
+      body: JSON.stringify({
+        to: user.email,
+        subject,
+        html,
+        text,
+        template: isSuspended ? 'account_suspended' : undefined,
+        data: isSuspended
+          ? {
+              userName: userDisplayName,
+              userEmail: user.email,
+              reason: 'Your account has been suspended by an administrator.',
+              supportEmail: process.env.SUPPORT_EMAIL || 'support@extrahand.in',
+              platformName
+            }
+          : undefined
+      })
+    });
+
+    if (!emailResponse.ok) {
+      const errorText = await emailResponse.text().catch(() => '');
+      console.error(`[Email] Failed to send ${action} email to ${user.email}:`, errorText || emailResponse.status);
+      return;
+    }
+
+    console.log(`[Email] ${action} notification queued for ${user.email}`);
+  } catch (error) {
+    console.error(`[Email] Error while sending ${action} notification:`, error.message);
+  }
+}
+
+function maskEmail(email) {
+  const value = String(email || '').trim();
+  if (!value || !value.includes('@')) return value || 'Hidden';
+  const [localPart, domain] = value.split('@');
+  const safeLocal = localPart.length <= 2
+    ? `${localPart[0] || '*'}*`
+    : `${localPart[0]}${'*'.repeat(Math.max(1, localPart.length - 2))}${localPart[localPart.length - 1]}`;
+  return `${safeLocal}@${domain}`;
+}
+
+function maskName(name) {
+  const value = String(name || '').trim();
+  if (!value) return 'Hidden';
+  if (value.length <= 2) return `${value[0]}*`;
+  return `${value[0]}${'*'.repeat(Math.max(1, value.length - 2))}${value[value.length - 1]}`;
+}
+
+function applyPrivacyMask(record) {
+  if (!record || typeof record !== 'object') return record;
+  return {
+    ...record,
+    customer_name: maskName(record.customer_name),
+    customer_email: maskEmail(record.customer_email)
+  };
+}
+
+async function shouldApplyPrivacyMode() {
+  try {
+    const settings = await db.getSettings();
+    return Boolean(settings?.privacyMode);
+  } catch (error) {
+    console.error('[Privacy] Failed to load privacy mode setting:', error.message);
+    return false;
+  }
+}
 
 // In-memory connection tracking
 const connections = {
@@ -93,6 +210,11 @@ function unlockSession(sessionId) {
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathParts = url.pathname.split('/').filter(Boolean);
 
@@ -166,6 +288,25 @@ wss.on('connection', (ws, req) => {
       });
     }
   }
+});
+
+// WebSocket heartbeat to avoid stale connections and proxy idle disconnect loops.
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('[WebSocket] Terminating stale connection');
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  });
+}, WS_HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
 });
 
 // Handle agent messages
@@ -459,13 +600,16 @@ async function sendDashboardUpdate(agentEmail) {
       }
     });
     const active = Array.from(activeMap.values());
+    const privacyModeEnabled = await shouldApplyPrivacyMode();
+    const pendingPayload = privacyModeEnabled ? pending.map(applyPrivacyMask) : pending;
+    const activePayload = privacyModeEnabled ? active.map(applyPrivacyMask) : active;
 
     const agentWs = connections.agents.get(agentEmail);
     if (agentWs && agentWs.readyState === WebSocket.OPEN) {
       agentWs.send(JSON.stringify({
         type: 'dashboard_update',
-        pending,
-        active
+        pending: pendingPayload,
+        active: activePayload
       }));
     }
   } catch (error) {
@@ -839,6 +983,43 @@ app.put('/api/admin/users/:id/role', async (req, res) => {
   }
 });
 
+// Update current user's display name
+app.put('/api/user/profile/name', async (req, res) => {
+  try {
+    const { email, name } = req.body;
+
+    if (!email || !name) {
+      return res.status(400).json({ error: 'Email and name are required' });
+    }
+
+    const trimmedName = String(name).trim();
+    if (trimmedName.length < 2) {
+      return res.status(400).json({ error: 'Name must be at least 2 characters long' });
+    }
+
+    const user = await db.updateUserNameByEmail(email, trimmedName);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await db.addPortalLog('USER_PROFILE_UPDATE', `Updated profile name for ${user.email}`, user.email);
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        status: user.status
+      }
+    });
+  } catch (error) {
+    console.error('[API Error] Failed to update profile name:', error);
+    res.status(500).json({ error: 'Failed to update profile name' });
+  }
+});
+
 // Suspend user
 // Suspend user
 app.put('/api/admin/users/:id/suspend', async (req, res) => {
@@ -849,6 +1030,9 @@ app.put('/api/admin/users/:id/suspend', async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
+
+    // Fire-and-forget email notification (do not block API success)
+    sendAccountStatusEmailNotification(user, 'suspended').catch(() => {});
 
     res.json({
       success: true,
@@ -871,6 +1055,9 @@ app.put('/api/admin/users/:id/activate', async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
+
+    // Fire-and-forget email notification (do not block API success)
+    sendAccountStatusEmailNotification(user, 'reactivated').catch(() => {});
 
     res.json({
       success: true,
@@ -926,7 +1113,8 @@ app.post('/api/admin/invite', async (req, res) => {
     // Send Invite Email via Email Service (extrahand-email-service)
     const emailBase = (process.env.EMAIL_SERVICE_URL || 'http://localhost:4007').replace(/\/$/, '');
     const emailServiceUrl = `${emailBase}/api/v1/email/admin-invite`;
-    const webAppUrl = process.env.WEB_APP_URL || 'http://localhost:3000';
+    // Invite links: set WEB_APP_URL=https://tickets.extrahand.in in production
+    const webAppUrl = (process.env.WEB_APP_URL || 'http://localhost:3000').replace(/\/$/, '');
     const inviteLink = `${webAppUrl}/accept-invite?token=${inviteToken}`;
     const serviceAuthToken = process.env.SERVICE_AUTH_TOKEN || 'ExtraHand_Secure_Token_2024_MinLength32Chars_ChangeInProduction';
 
@@ -1539,16 +1727,26 @@ app.get('/api/supervisor/team', async (req, res) => {
 // Get all tickets for supervisor view
 app.get('/api/supervisor/tickets/all', async (req, res) => {
   try {
-    // Get all sessions (pending, active, and recent closed)
-    const [pending, active, closed] = await Promise.all([
-      db.getPendingSessions(),
-      db.getAllActiveSessions(),
-      db.getClosedSessions(null, null, 100) // Last 100 closed tickets
-    ]);
+    const { page = 1, limit = 20, status = 'all', search = '', sortBy = 'newest' } = req.query;
+    const result = await db.getSupervisorTicketsPaginated({
+      page,
+      limit,
+      status,
+      search,
+      sortBy
+    });
+    const privacyModeEnabled = await shouldApplyPrivacyMode();
+    const tickets = privacyModeEnabled ? result.tickets.map(applyPrivacyMask) : result.tickets;
 
-    const allTickets = [...pending, ...active, ...closed];
-
-    res.json({ tickets: allTickets });
+    res.json({
+      tickets,
+      pagination: {
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+        totalPages: result.totalPages
+      }
+    });
   } catch (error) {
     console.error('[API Error] Failed to fetch all tickets:', error);
     res.status(500).json({ error: 'Failed to fetch tickets' });
@@ -1839,6 +2037,16 @@ global.addAgentNotification = addNotification;
 // INQUIRY DESK API ENDPOINTS
 // ============================================
 
+function getInquiryRequestContext(req) {
+  const roleHeader = String(req.headers['x-user-role'] || '').toLowerCase();
+  const emailHeader = String(req.headers['x-user-email'] || '').toLowerCase();
+  const userIdHeader = String(req.headers['x-user-id'] || '').trim();
+  const requestedScope = String(req.query.scope || '').toLowerCase();
+  const isPrivileged = roleHeader === 'admin' || roleHeader === 'supervisor';
+  const scope = requestedScope || (isPrivileged ? 'all' : 'mine');
+  return { roleHeader, emailHeader, userIdHeader, isPrivileged, scope };
+}
+
 // Submit a new inquiry (public endpoint)
 app.post('/api/inquiries', async (req, res) => {
   try {
@@ -1894,17 +2102,35 @@ app.get('/api/inquiries', async (req, res) => {
   try {
     const { status, assigned_agent, priority } = req.query;
     const filters = {};
+    const { emailHeader, userIdHeader, isPrivileged, scope } = getInquiryRequestContext(req);
+
+    // Phase-1 enforcement: agents can only view their own inquiries.
+    if (!isPrivileged && !emailHeader && !userIdHeader) {
+      return res.status(400).json({ error: 'x-user-email or x-user-id header is required for agent inquiry scope' });
+    }
 
     if (status) filters.status = status;
-    if (assigned_agent) filters.assigned_agent = assigned_agent;
     if (priority) filters.priority = priority;
 
+    if (scope === 'mine' || !isPrivileged) {
+      filters.assigned_agent_identity = {
+        id: userIdHeader || undefined,
+        email: emailHeader || undefined
+      };
+    } else if (scope === 'all') {
+      if (assigned_agent) filters.assigned_agent = assigned_agent;
+    } else {
+      return res.status(400).json({ error: 'Invalid scope. Use mine or all.' });
+    }
+
     const inquiries = await db.getAllInquiries(filters);
+    const privacyModeEnabled = await shouldApplyPrivacyMode();
+    const inquiriesPayload = privacyModeEnabled ? inquiries.map(applyPrivacyMask) : inquiries;
 
     res.json({
       success: true,
-      count: inquiries.length,
-      inquiries
+      count: inquiriesPayload.length,
+      inquiries: inquiriesPayload
     });
   } catch (error) {
     console.error('[API Error] Failed to fetch inquiries:', error);
@@ -1921,7 +2147,8 @@ app.get('/api/inquiries/:id', async (req, res) => {
       return res.status(404).json({ error: 'Inquiry not found' });
     }
 
-    res.json({ success: true, inquiry });
+    const privacyModeEnabled = await shouldApplyPrivacyMode();
+    res.json({ success: true, inquiry: privacyModeEnabled ? applyPrivacyMask(inquiry) : inquiry });
   } catch (error) {
     console.error('[API Error] Failed to fetch inquiry:', error);
     res.status(500).json({ error: 'Failed to fetch inquiry' });
@@ -1989,22 +2216,38 @@ app.put('/api/inquiries/:id/status', async (req, res) => {
 // Assign inquiry to agent
 app.put('/api/inquiries/:id/assign', async (req, res) => {
   try {
-    const { agent_email } = req.body;
+    const { agent_email, agent_id } = req.body;
+    let targetAgentEmail = agent_email;
+    let targetAgentId = agent_id || null;
 
-    if (!agent_email) {
-      return res.status(400).json({ error: 'Agent email is required' });
+    if (!targetAgentEmail && targetAgentId) {
+      const userById = await db.getUserById(targetAgentId);
+      if (!userById) {
+        return res.status(404).json({ error: 'Agent not found for provided agent_id' });
+      }
+      targetAgentEmail = userById.email;
+      targetAgentId = userById._id || userById.id;
+    } else if (!targetAgentId && targetAgentEmail) {
+      const userByEmail = await db.getUserByEmail(targetAgentEmail);
+      if (userByEmail) {
+        targetAgentId = userByEmail._id || userByEmail.id;
+      }
     }
 
-    const inquiry = await db.assignInquiryToAgent(req.params.id, agent_email);
+    if (!targetAgentEmail) {
+      return res.status(400).json({ error: 'agent_email or agent_id is required' });
+    }
+
+    const inquiry = await db.assignInquiryToAgent(req.params.id, targetAgentEmail, targetAgentId);
 
     if (!inquiry) {
       return res.status(404).json({ error: 'Inquiry not found' });
     }
 
-    console.log(`[Inquiry] Assigned: ${inquiry.id} -> ${agent_email}`);
+    console.log(`[Inquiry] Assigned: ${inquiry.id} -> ${targetAgentEmail} (${targetAgentId || 'no-id'})`);
 
     // Notify the assigned agent
-    const agentWs = connections.agents.get(agent_email);
+    const agentWs = connections.agents.get(targetAgentEmail);
     if (agentWs && agentWs.readyState === WebSocket.OPEN) {
       agentWs.send(JSON.stringify({
         type: 'inquiry_assigned',
@@ -2056,7 +2299,22 @@ app.put('/api/inquiries/:id/notes', async (req, res) => {
 // Get inquiry statistics
 app.get('/api/inquiries/stats/summary', async (req, res) => {
   try {
-    const allInquiries = await db.getAllInquiries();
+    const { emailHeader, userIdHeader, isPrivileged, scope } = getInquiryRequestContext(req);
+    let allInquiries;
+
+    if (scope === 'all' && isPrivileged) {
+      allInquiries = await db.getAllInquiries();
+    } else {
+      if (!emailHeader && !userIdHeader) {
+        return res.status(400).json({ error: 'x-user-email or x-user-id header is required for agent inquiry scope' });
+      }
+      allInquiries = await db.getAllInquiries({
+        assigned_agent_identity: {
+          id: userIdHeader || undefined,
+          email: emailHeader || undefined
+        }
+      });
+    }
 
     const stats = {
       total: allInquiries.length,
