@@ -64,25 +64,39 @@ async function sendAccountStatusEmailNotification(user, action) {
     const emailServiceUrl = `${emailBase}/api/v1/email/send`;
     const serviceAuthToken =
       process.env.SERVICE_AUTH_TOKEN || 'ExtraHand_Secure_Token_2024_MinLength32Chars_ChangeInProduction';
-    const platformName = process.env.TICKET_INVITE_PLATFORM_NAME || 'Ticket Management Portal';
+    const platformName = process.env.TICKET_INVITE_PLATFORM_NAME || 'ExtraHand Ticket Management Portal';
+    const portalUrl =
+      process.env.TICKET_PORTAL_URL ||
+      process.env.WEB_APP_URL ||
+      process.env.FRONTEND_URL ||
+      'https://tickets.extrahand.in';
     const userDisplayName = user.name || user.email.split('@')[0];
     const isSuspended = action === 'suspended';
     const subject = isSuspended
-      ? `Account Access Suspended - ${platformName}`
-      : `Account Access Restored - ${platformName}`;
+      ? `Account Suspended - ${platformName}`
+      : `Account Reactivated - ${platformName}`;
     const statusLine = isSuspended
       ? 'Your account access has been temporarily suspended by an administrator.'
       : 'Your account access has been restored. You can now sign in again.';
     const helpLine = isSuspended
       ? 'If you believe this is incorrect, please contact your administrator.'
       : 'If you still face issues signing in, please contact support.';
+    const actionMessage = isSuspended
+      ? 'You will not be able to access the ticket dashboard, view assigned chats, or respond to customer inquiries until your access is restored.'
+      : `You can now access your dashboard and continue handling tickets. Sign in here: ${portalUrl}`;
 
     const html = `
       <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
         <h2 style="margin-bottom:12px;">${isSuspended ? 'Account Suspended' : 'Account Reactivated'}</h2>
         <p>Hello ${userDisplayName},</p>
         <p>${statusLine}</p>
+        <p>${actionMessage}</p>
         <p>${helpLine}</p>
+        <div style="margin-top:20px;padding:12px 14px;border:1px solid #e5e7eb;border-radius:8px;background:#f9fafb;">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:4px;">Portal</div>
+          <div style="font-size:14px;font-weight:600;color:#111827;">${platformName}</div>
+          <div style="font-size:13px;color:#4b5563;margin-top:2px;">${portalUrl}</div>
+        </div>
         <p style="margin-top:20px;">Regards,<br/>${platformName} Team</p>
       </div>
     `;
@@ -91,10 +105,12 @@ async function sendAccountStatusEmailNotification(user, action) {
       ``,
       `Hello ${userDisplayName},`,
       `${statusLine}`,
+      `${actionMessage}`,
       `${helpLine}`,
       ``,
       `Regards,`,
-      `${platformName} Team`
+      `${platformName} Team`,
+      `Portal: ${portalUrl}`
     ].join('\n');
 
     const emailResponse = await fetch(emailServiceUrl, {
@@ -108,17 +124,7 @@ async function sendAccountStatusEmailNotification(user, action) {
         to: user.email,
         subject,
         html,
-        text,
-        template: isSuspended ? 'account_suspended' : undefined,
-        data: isSuspended
-          ? {
-              userName: userDisplayName,
-              userEmail: user.email,
-              reason: 'Your account has been suspended by an administrator.',
-              supportEmail: process.env.SUPPORT_EMAIL || 'support@extrahand.in',
-              platformName
-            }
-          : undefined
+        text
       })
     });
 
